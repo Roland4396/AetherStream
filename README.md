@@ -179,7 +179,7 @@ uvicorn proxy:app --host 0.0.0.0 --port 3002 --reload
 语法检查：
 
 ```bash
-python -m py_compile *.py
+python -m py_compile *.py $(find aetherstream -name '*.py')
 ```
 
 ## 安全注意事项
@@ -224,4 +224,4 @@ AetherStream 不是一个“只转发请求”的简单 proxy，而是一个面�
 
 ## License
 
-请在公开正式使用前补充 License。
+MIT License，详见 [LICENSE](./LICENSE)。

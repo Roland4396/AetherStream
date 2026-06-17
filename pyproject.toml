@@ -1,0 +1,36 @@
+[project]
+name = "aetherstream"
+version = "0.1.0"
+description = "Multi-provider OpenAI-compatible streaming proxy with protocol routing, SSE replay, and non-stream-to-stream conversion."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Roland4396" }
+]
+dependencies = [
+  "fastapi>=0.111,<1.0",
+  "uvicorn[standard]>=0.30,<1.0",
+  "httpx[http2]>=0.27,<1.0",
+  "docker>=7.0,<8.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [
+  "__pycache__",
+  ".git",
+  ".venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+  "E501",
+]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+line-ending = "lf"
