@@ -1,0 +1,12 @@
+services:
+  stream-proxy:
+    build: .
+    container_name: stream-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3002:3002"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./runtime-flags.json:/app/runtime-flags.json:ro

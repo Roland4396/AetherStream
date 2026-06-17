@@ -1,0 +1,54 @@
+{
+  "openai_compatible_upstreams": [
+    {
+      "name": "example-openai-compatible",
+      "base_url": "https://api.example.com/v1",
+      "api_key_env": "EXAMPLE_OPENAI_API_KEY"
+    }
+  ],
+  "claude": {
+    "prompt_caching": {
+      "enabled": false,
+      "type": "ephemeral",
+      "ttl": "",
+      "mode": "explicit",
+      "keepalive": {
+        "enabled": false,
+        "interval_sec": 240,
+        "max_tokens": 1,
+        "first_data_timeout_sec": 60,
+        "max_runs": 5,
+        "post_delay_sec": 240
+      }
+    },
+    "output_config": {
+      "effort": ""
+    },
+    "client_compat": {
+      "thinking": {
+        "type": "disabled"
+      },
+      "tools": {
+        "enabled": true
+      },
+      "context_management": {
+        "enabled": false,
+        "edits": []
+      }
+    },
+    "keyword_filter": {
+      "enabled": false,
+      "keywords": []
+    },
+    "session": {
+      "ttl_sec": 1800
+    }
+  },
+  "early_stop": {
+    "enabled": false,
+    "tags": [
+      "<disclaimer>"
+    ],
+    "case_sensitive": true
+  }
+}

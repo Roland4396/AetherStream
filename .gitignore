@@ -1,0 +1,30 @@
+# Runtime secrets / local config
+.env
+.env.*
+!.env.example
+runtime-flags.json
+*.local.json
+*.secret.json
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Logs / generated data
+logs/
+*.log
+*.tmp
+.DS_Store
+
+# Local backups
+*.bak
+*.bak-*
+*_bak*
+*~
