@@ -85,7 +85,7 @@ PRO_OPUS_LAST_USER_APPEND_TEXT = """!!important!!
    正文中不得照搬 stage 原句、原动作、原心理结论或原结果链。
    需要让 NPC 根据自己的已知信息、性格、利益、处境和上一轮余波自然行动；不能让 NPC 为了完成 stage 而行动。
 !!important!!"""
-PRO_OPUS_LAST_USER_APPEND_MARKER = "!!important!!\n在使用任何 stage 素材、或承接用户输入中的结果性安排前，必须先进行【安排审查】。"
+PRO_OPUS_LAST_USER_APPEND_MARKER = "!!important!!\n在使用任何 stage 素材、或承接用户输入中的结果性安排前，必须先进行【stage纠错重写】。"
 PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT = "（记得插图）（记得插图）（记得插图）"
 PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER = "（记得插图）"
 

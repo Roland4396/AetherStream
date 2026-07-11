@@ -16,10 +16,18 @@ class ASGIWiretapMiddleware:
     send() failure, or only from task cancellation after the client socket closes.
     """
 
-    def __init__(self, app: ASGIApp, *, log: Callable[[str], None], fmt_ms: Callable[..., str]):
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        log: Callable[[str], None],
+        fmt_ms: Callable[..., str],
+        release_trace: Callable[[str], None] | None = None,
+    ):
         self.app = app
         self._log = log
         self._fmt_ms = fmt_ms
+        self._release_trace = release_trace
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get('type') != 'http':
@@ -165,6 +173,14 @@ class ASGIWiretapMiddleware:
             )
             raise
         finally:
+            if self._release_trace is not None:
+                try:
+                    self._release_trace(trace_id)
+                except Exception as release_error:
+                    log(
+                        f"[TRACE {trace_id}] asgi_release_trace_error "
+                        f"err={type(release_error).__name__}: {release_error}"
+                    )
             idle_after_last = '-'
             if last_body_at is not None:
                 idle_after_last = f"{(time.perf_counter() - last_body_at) * 1000:.1f}ms"

@@ -175,9 +175,29 @@ async def forward_codex_chat_stream(
     raw_sse_truncated = False
     saw_completed = False
     final_usage: dict[str, Any] = {}
+    saved_log = False
     keepalive_interval = 10.0
     keepalive_count = 0
     last_downstream_emit = time.perf_counter()
+
+    def persist_log(response_text: str, *, raw_sse: str = "", error_type: str | None = None) -> None:
+        nonlocal saved_log
+        if saved_log:
+            return
+        try:
+            deps.save_request_log(
+                model,
+                messages,
+                response_text,
+                stream=True,
+                raw_sse=raw_sse,
+                request_payload=request_data,
+                error_type=error_type,
+                trace_id=trace_id,
+            )
+            saved_log = True
+        except Exception as save_err:
+            deps.log(f"{trace_prefix}codex_stream_log_error err={save_err}")
 
     def emit_done() -> bytes:
         return b"data: [DONE]\n\n"
@@ -249,15 +269,10 @@ async def forward_codex_chat_stream(
             if response.status_code != 200:
                 content = await response.aread()
                 error_text = content.decode(errors="replace")[:4000]
-                deps.save_request_log(
-                    model,
-                    messages,
+                persist_log(
                     f"[UPSTREAM_HTTP_ERROR] {error_text}",
-                    stream=True,
                     raw_sse=f"[HTTP {response.status_code}]\n{error_text}",
-                    request_payload=request_data,
                     error_type="codex_upstream_http_error",
-                    trace_id=trace_id,
                 )
                 finish_status = f"upstream_http_{response.status_code}"
                 yield deps.build_openai_sse_error(
@@ -312,15 +327,10 @@ async def forward_codex_chat_stream(
                 if isinstance(data.get("error"), dict):
                     err = data["error"]
                     err_msg = err.get("message") or json.dumps(err, ensure_ascii=False)
-                    deps.save_request_log(
-                        model,
-                        messages,
+                    persist_log(
                         f"[UPSTREAM_ERROR_EVENT] {err_msg}",
-                        stream=True,
                         raw_sse="\n".join(raw_sse_lines),
-                        request_payload=request_data,
                         error_type="codex_upstream_error_event",
-                        trace_id=trace_id,
                     )
                     finish_status = "upstream_error_event"
                     yield deps.build_openai_sse_error(
@@ -366,14 +376,9 @@ async def forward_codex_chat_stream(
                             model=model,
                             finish_reason="stop",
                         )
-                        deps.save_request_log(
-                            model,
-                            messages,
+                        persist_log(
                             full_response or "[empty response]",
-                            stream=True,
                             raw_sse="\n".join(raw_sse_lines),
-                            request_payload=request_data,
-                            trace_id=trace_id,
                         )
                         finish_status = "early_stop_tag"
                         await _close_upstream_stream(
@@ -431,14 +436,9 @@ async def forward_codex_chat_stream(
                         model=model,
                         finish_reason="stop",
                     )
-                    deps.save_request_log(
-                        model,
-                        messages,
+                    persist_log(
                         full_response or "[empty response]",
-                        stream=True,
                         raw_sse="\n".join(raw_sse_lines),
-                        request_payload=request_data,
-                        trace_id=trace_id,
                     )
                     finish_status = "codex_response_completed"
                     last_downstream_emit = time.perf_counter()
@@ -447,15 +447,10 @@ async def forward_codex_chat_stream(
                     return
 
             finish_status = "codex_incomplete_stream_end"
-            deps.save_request_log(
-                model,
-                messages,
+            persist_log(
                 full_response or "[empty response]",
-                stream=True,
                 raw_sse="\n".join(raw_sse_lines + ["[UPSTREAM_INCOMPLETE]"]),
-                request_payload=request_data,
                 error_type="codex_upstream_incomplete",
-                trace_id=trace_id,
             )
             yield deps.build_openai_sse_error(
                 502,
@@ -463,6 +458,21 @@ async def forward_codex_chat_stream(
                 "upstream_stream_incomplete",
             )
             yield emit_done()
+        except (asyncio.CancelledError, GeneratorExit) as close_exc:
+            if isinstance(close_exc, asyncio.CancelledError):
+                close_reason = "downstream_cancelled"
+                close_marker = "[CANCELLED: downstream client disconnected]"
+            else:
+                close_reason = "downstream_closed"
+                close_marker = "[GENERATOR_CLOSED: downstream stopped consuming stream]"
+            if finish_status == "unknown":
+                finish_status = close_reason
+            persist_log(
+                full_response or "[cancelled before content]",
+                raw_sse="\n".join(raw_sse_lines + [close_marker]),
+                error_type=close_reason,
+            )
+            raise
         finally:
             await cm.__aexit__(None, None, None)
             await client.aclose()
@@ -470,32 +480,41 @@ async def forward_codex_chat_stream(
         finish_status = "downstream_cancelled"
         if upstream_task is not None and not upstream_task.done():
             upstream_task.cancel()
-        deps.save_request_log(
-            model,
-            messages,
+        persist_log(
             full_response or "[cancelled before content]",
-            stream=True,
             raw_sse="\n".join(raw_sse_lines + ["[CANCELLED: downstream client disconnected]"]),
-            request_payload=request_data,
             error_type="downstream_cancelled",
-            trace_id=trace_id,
+        )
+        raise
+    except GeneratorExit:
+        if finish_status == "unknown":
+            finish_status = "downstream_closed"
+        if upstream_task is not None and not upstream_task.done():
+            upstream_task.cancel()
+        persist_log(
+            full_response or "[cancelled before content]",
+            raw_sse="\n".join(raw_sse_lines + ["[GENERATOR_CLOSED: downstream stopped consuming stream]"]),
+            error_type="downstream_closed",
         )
         raise
     except Exception as e:
         finish_status = f"exception:{type(e).__name__}"
-        deps.save_request_log(
-            model,
-            messages,
+        persist_log(
             full_response + f"\n[ERROR] {e}" if full_response else f"[ERROR] {e}",
-            stream=True,
             raw_sse="\n".join(raw_sse_lines + [f"[EXCEPTION] {e}"]),
-            request_payload=request_data,
             error_type="codex_upstream_proxy_error",
-            trace_id=trace_id,
         )
         yield deps.build_openai_sse_error(502, str(e), "codex_upstream_proxy_error")
         yield emit_done()
     finally:
+        if not saved_log:
+            if finish_status == "unknown":
+                finish_status = "generator_finalized_without_terminal_event"
+            persist_log(
+                full_response or "[stream finalized before content]",
+                raw_sse="\n".join(raw_sse_lines + ["[FINALIZED_WITHOUT_TERMINAL_EVENT]"]),
+                error_type="codex_stream_finalized",
+            )
         if caller_key:
             deps.release_caller(caller_key, trace_id)
         deps.log(

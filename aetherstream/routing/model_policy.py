@@ -14,7 +14,8 @@ class ModelPolicy:
             return False
         model_lower = model_name.lower()
         # Explicit provider prefixes must win over model-family heuristics.
-        # free/xxx is Pioneer/Anthropic-native, even if xxx contains "gemini".
+        # free/xxx is routed by the stream-proxy free-channel branch before the
+        # built-in Gemini branch, so do not let it fall into direct Gemini HTTP.
         if '/' in model_lower:
             prefix, _, _ = model_lower.partition('/')
             if prefix in ('free', 'codecli'):
@@ -31,16 +32,23 @@ class ModelPolicy:
             return False
         name = model_name.lower()
         # Provider prefixes are explicit routing hints.
-        # free/xxx is Pioneer/Anthropic-native even when xxx is not named claude-*.
+        # free/ only uses Anthropic when the real model is Claude.  Non-Claude
+        # free models are OpenAI-compatible through the Pioneer/account pool.
         # codecli remains restricted to Claude-looking model ids.
         if '/' in name:
             prefix, _, rest = name.partition('/')
             if prefix == 'free':
-                return bool(rest)
+                return self.is_claude_family(rest)
             if prefix == 'codecli':
-                return rest.startswith('claude-')
+                return self.is_claude_family(rest)
             return False
-        return name.startswith("claude-")
+        return self.is_claude_family(name)
+
+    def is_claude_family(self, model_name: str) -> bool:
+        if not model_name:
+            return False
+        name = model_name.lower()
+        return name.startswith("claude-") or "/claude-" in name or "anthropic/claude-" in name
 
     def is_gpt_model(self, model_name: str) -> bool:
         if not model_name:

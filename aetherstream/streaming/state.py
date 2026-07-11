@@ -34,3 +34,21 @@ class ActiveStreamRegistry:
         if current and current.get("trace_id") == trace_id:
             self._active.pop(caller_key, None)
             self._log(f"[TRACE {trace_id}] caller_release caller={caller_key}")
+
+    def release_trace(self, trace_id: str) -> None:
+        """Release a request at the HTTP lifecycle boundary.
+
+        Provider generators also release by caller key. This trace-based fallback
+        is deliberately idempotent and covers providers that do not know about
+        the registry, early JSON errors, and local diagnostic streams.
+        """
+        if not trace_id:
+            return
+        for caller_key, current in list(self._active.items()):
+            if current.get("trace_id") != trace_id:
+                continue
+            self._active.pop(caller_key, None)
+            self._log(f"[TRACE {trace_id}] caller_release_trace caller={caller_key}")
+
+    def __len__(self) -> int:
+        return len(self._active)

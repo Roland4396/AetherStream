@@ -16,12 +16,15 @@ import threading
 import copy
 import re
 import asyncio
-import hashlib
 from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
+from aetherstream.api.admin_routes import register_routes as register_admin_routes
+from aetherstream.api.chat_routes import register_routes as register_chat_routes
+from aetherstream.api.messages_routes import register_routes as register_messages_routes
+from aetherstream.api.system_routes import register_routes as register_system_routes
 from aetherstream.config.urls import (
     normalize_codex_responses_base_url,
     normalize_openai_chat_base_url,
@@ -31,10 +34,8 @@ from aetherstream.runtime.flags import RuntimeFlags
 from aetherstream.upstreams.anthropic import AnthropicUpstreamDeps, forward_anthropic_stream
 from aetherstream.upstreams.anthropic import (
     collect_anthropic_chat_completion,
-    collect_anthropic_chat_completion_from_raw_sse,
     collect_anthropic_message_response,
     forward_anthropic_chat_stream,
-    replay_anthropic_chat_stream,
 )
 from aetherstream.upstreams.codex import (
     CodexUpstreamDeps,
@@ -54,7 +55,6 @@ from aetherstream.upstreams.openai import (
     collect_stream,
     forward_non_stream_as_openai_stream,
     forward_stream,
-    replay_openai_chat_stream,
 )
 from aetherstream.observability.logging import ProxyLogger
 from aetherstream.observability.summaries import (
@@ -65,12 +65,11 @@ from aetherstream.observability.summaries import (
 )
 from aetherstream.observability.wiretap import ASGIWiretapMiddleware
 from aetherstream.transforms.requests import (
-    append_to_last_user_message,
     convert_chat_to_anthropic_messages_request,
     convert_chat_to_responses_request,
-    insert_after_latest_human_message,
 )
 from aetherstream.streaming.sse import build_openai_sse_error
+from aetherstream.streaming.dedupe import ExactRequestCoalescer
 from aetherstream.streaming.state import ActiveStreamRegistry
 from aetherstream.utils.coerce import (
     coerce_bool as _coerce_bool,
@@ -81,7 +80,8 @@ from aetherstream.features.drawing_filter import (
     apply_drawing_context_filter,
     should_apply_deepseek_drawing_context_filter,
 )
-from aetherstream.features.claude_replay import ClaudeReplayStore
+from aetherstream.features.claude_replay import ReplayStore
+from aetherstream.features.replay import ReplayService
 from aetherstream.features.gpt_policy import (
     build_gpt_prompt_cache_key,
     inject_gpt_usage_policies_system_message,
@@ -94,20 +94,8 @@ from aetherstream.features.pro_compat import (
     apply_pro_no_reasoning_payload,
     should_append_pro_opus46_last_user_note,
 )
-from aetherstream.features.opus_notes import (
-    PRO_OPUS46_LAST_USER_APPEND_MARKER,
-    PRO_OPUS46_LAST_USER_APPEND_TEXT,
-    PRO_OPUS_LAST_USER_APPEND_MARKER,
-    PRO_OPUS_LAST_USER_APPEND_TEXT,
-    PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
-    PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
-)
 
 app = FastAPI()
-
-
-
-
 # Upstream service configuration
 GEMINI_BASE_URL = os.environ.get('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com').rstrip('/')
 TIMEOUT = int(os.environ.get('TIMEOUT', '600'))
@@ -138,7 +126,10 @@ CODEX_REASONING_SUMMARY = os.environ.get('CODEX_REASONING_SUMMARY', '').strip()
 CLAUDE_API_KEY = os.environ.get('CLAUDE_API_KEY', os.environ.get('ANTHROPIC_API_KEY', ''))
 CLAUDE_BASE_URL = os.environ.get('CLAUDE_BASE_URL', os.environ.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com')).rstrip('/')
 
-# Claude provider prefixes: free/ → CLAUDE_*, codecli/ → CLAUDE2_*
+# Claude provider prefixes: free/ → CLAUDE_*, codecli/ → CLAUDE2_*.
+# Important: free/ is a Pioneer/account-pool channel, not an Anthropic-only
+# model family.  Only free/claude-* should use /v1/messages; all other free/*
+# models use OpenAI-compatible /v1/chat/completions through the same pool.
 CLAUDE2_API_KEY = os.environ.get('CLAUDE2_API_KEY', '').strip()
 CLAUDE2_BASE_URL = os.environ.get('CLAUDE2_BASE_URL', '').rstrip('/')
 
@@ -168,6 +159,81 @@ def get_claude_upstream_for_provider(provider: str) -> tuple[str, str]:
         return CLAUDE2_API_KEY, CLAUDE2_BASE_URL
     # default / 'free'
     return CLAUDE_API_KEY, CLAUDE_BASE_URL
+
+
+def parse_free_provider_prefix(model: Any) -> tuple[bool, str]:
+    model_name = str(model or '').strip()
+    if '/' not in model_name:
+        return False, model_name
+    prefix, _, rest = model_name.partition('/')
+    if prefix.lower() != 'free' or not rest:
+        return False, model_name
+    return True, rest
+
+
+def build_free_openai_chat_url(base_url: str | None = None) -> str:
+    base = (base_url or CLAUDE_BASE_URL or '').rstrip('/')
+    if not base:
+        return 'https://api.openai.com/v1/chat/completions'
+    if base.endswith('/v1/chat/completions') or base.endswith('/chat/completions'):
+        return base
+    if base.endswith('/v1'):
+        return f'{base}/chat/completions'
+    return f'{base}/v1/chat/completions'
+
+
+def build_free_openai_headers(api_key: str | None = None) -> dict[str, str]:
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+    }
+    key = (api_key or CLAUDE_API_KEY or '').strip()
+    if key:
+        headers['Authorization'] = f'Bearer {key}'
+    return headers
+
+
+OPENAI_THINKING_DISABLED_MODEL_MARKERS = (
+    'zai-org/',
+    'glm-',
+    'glm_',
+    'xiaomimimo/',
+    'mimo-',
+    'mimo_',
+    'qwen',
+)
+
+
+def should_disable_openai_template_thinking(model: Any) -> bool:
+    """Models behind OpenAI-compatible gateways that may emit only reasoning_content.
+
+    The database filler parser consumes normal message content.  Some OpenAI-
+    compatible providers expose model thinking as `reasoning_content`; if the
+    model stops before producing normal `content`, the plugin sees an empty
+    answer and retries forever.  Wafer/Pioneer-compatible GLM/MiMo stacks
+    explicitly support `chat_template_kwargs.enable_thinking=false`.
+    """
+    model_name = str(model or '').strip().lower()
+    return bool(model_name) and any(marker in model_name for marker in OPENAI_THINKING_DISABLED_MODEL_MARKERS)
+
+
+def apply_openai_template_thinking_disabled(payload: dict, model: Any) -> bool:
+    """Mutate OpenAI-compatible payload to disable template thinking when safe.
+
+    Returns true when the payload was changed.
+    """
+    if not should_disable_openai_template_thinking(model):
+        return False
+    kwargs = payload.get('chat_template_kwargs')
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+    if kwargs.get('enable_thinking') is False:
+        payload['chat_template_kwargs'] = kwargs
+        return False
+    kwargs = dict(kwargs)
+    kwargs['enable_thinking'] = False
+    payload['chat_template_kwargs'] = kwargs
+    return True
 CLAUDE_CODE_VERSION = os.environ.get('CLAUDE_CODE_VERSION', '2.1.119').strip() or '2.1.119'
 CLAUDE_USER_ID = os.environ.get('CLAUDE_USER_ID', '').strip()
 CLAUDE_BILLING_HEADER = os.environ.get('CLAUDE_BILLING_HEADER', '').strip()
@@ -256,14 +322,14 @@ def _normalize_openai_base_url(raw_url: Any) -> str:
     return base
 
 
-def get_openai_compatible_upstreams() -> list[dict[str, str]]:
+def get_openai_compatible_upstreams() -> list[dict[str, Any]]:
     raw = _runtime_lookup('openai_compatible_upstreams')
     if raw is None:
         raw = _runtime_lookup('model_directory', 'openai_compatible_upstreams')
     if not isinstance(raw, list):
         return []
 
-    upstreams: list[dict[str, str]] = []
+    upstreams: list[dict[str, Any]] = []
     seen: set[str] = set()
     for idx, item in enumerate(raw):
         if not isinstance(item, dict):
@@ -282,8 +348,34 @@ def get_openai_compatible_upstreams() -> list[dict[str, str]]:
             'base_url': base_url,
             'api_key': api_key,
             'api_key_env': api_key_env,
+            'include_models': _coerce_string_list(item.get('include_models'), []),
+            'include_model_families': _coerce_string_list(item.get('include_model_families'), []),
         })
     return upstreams
+
+
+def _upstream_allows_model(upstream: dict[str, Any], model_id: str) -> bool:
+    families = upstream.get('include_model_families')
+    if not isinstance(families, list) or not families:
+        return True
+
+    normalized = {str(family or '').strip().lower() for family in families}
+    normalized.discard('')
+    if not normalized:
+        return True
+
+    if normalized.intersection({'claude', 'anthropic'}) and model_policy.is_claude_family(model_id):
+        return True
+    if 'gemini' in normalized and model_policy.is_gemini_model(model_id):
+        return True
+    if normalized.intersection({'gpt', 'openai'}) and (
+        model_policy.is_gpt_model(model_id)
+        or str(model_id or '').lower().startswith('openai/')
+    ):
+        return True
+    if 'deepseek' in normalized and 'deepseek' in str(model_id or '').lower():
+        return True
+    return False
 
 
 def _openai_compatible_upstream_text(upstream: dict[str, str]) -> str:
@@ -302,11 +394,11 @@ def _copy_upstream_with_reason(upstream: dict[str, str], reason: str) -> dict[st
 
 
 def _find_openai_compatible_upstream(
-    upstreams: list[dict[str, str]],
+    upstreams: list[dict[str, Any]],
     markers: tuple[str, ...],
     *,
     allow_fake: bool = False,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     # Prefer real upstreams. The local fake-openai service is for testing and
     # should not steal model-family pass-through just because its name contains
     # "openai".
@@ -321,7 +413,7 @@ def _find_openai_compatible_upstream(
     return _find_openai_compatible_upstream(upstreams, markers, allow_fake=True)
 
 
-def resolve_model_name_passthrough_upstream(model: Any) -> dict[str, str] | None:
+def resolve_model_name_passthrough_upstream(model: Any) -> dict[str, Any] | None:
     """Pick an OpenAI-compatible pass-through upstream by model-id family.
 
     This is only used after explicit /v1/models routing and built-in
@@ -411,9 +503,7 @@ async def refresh_model_directory(
 
     for model_id in sorted(model_policy.allowed_claude_models):
         local_models.append({"id": model_id, "object": "model", "owned_by": "anthropic"})
-        # 添加带前缀的 Claude 模型（free/ 和 codecli/）
-        if CLAUDE_API_KEY:
-            local_models.append({"id": f"free/{model_id}", "object": "model", "owned_by": "anthropic-free"})
+        # codecli/ remains a Claude-direct channel.
         if CLAUDE2_API_KEY:
             local_models.append({"id": f"codecli/{model_id}", "object": "model", "owned_by": "anthropic-codecli"})
 
@@ -437,6 +527,26 @@ async def refresh_model_directory(
         for upstream in upstreams:
             name = upstream['name']
             base_url = upstream['base_url']
+            include_models = upstream.get('include_models')
+            if isinstance(include_models, list) and include_models:
+                upstream_model_count = 0
+                for model_id in include_models:
+                    model_id = str(model_id or '').strip()
+                    if not model_id or not _upstream_allows_model(upstream, model_id):
+                        continue
+                    local_models.append({"id": model_id, "object": "model", "owned_by": name})
+                    routes[model_id] = {
+                        'name': name,
+                        'base_url': base_url,
+                        'api_key': upstream.get('api_key') or '',
+                        'pioneer_upstream': False,
+                    }
+                    upstream_model_count += 1
+                log(
+                    "model_directory upstream_static "
+                    f"name={name} models={upstream_model_count} base_url={base_url}"
+                )
+                continue
             models_url = f"{base_url}/models"
             headers = {'Accept': 'application/json'}
             if upstream.get('api_key'):
@@ -459,6 +569,16 @@ async def refresh_model_directory(
                 log(f"model_directory upstream={name} ignored: data_not_list")
                 continue
 
+            pioneer_router_listing = False
+            for item in data:
+                if isinstance(item, dict):
+                    listed_model_id = str(item.get('id') or item.get('name') or item.get('model') or '').strip()
+                else:
+                    listed_model_id = str(item or '').strip()
+                if listed_model_id == 'pioneer/auto':
+                    pioneer_router_listing = True
+                    break
+
             upstream_model_count = 0
             for item in data:
                 if isinstance(item, dict):
@@ -469,19 +589,27 @@ async def refresh_model_directory(
                     model_item = {"id": model_id, "object": "model"}
                 if not model_id:
                     continue
+                if pioneer_router_listing and model_id in {'pioneer/auto', 'anthropic/pioneer-auto'}:
+                    continue
+                if not _upstream_allows_model(upstream, model_id):
+                    continue
                 model_item.setdefault('id', model_id)
                 model_item.setdefault('object', 'model')
                 model_item.setdefault('owned_by', name)
                 local_models.append(model_item)
+                if CLAUDE_API_KEY and pioneer_router_listing:
+                    local_models.append({"id": f"free/{model_id}", "object": "model", "owned_by": "pioneer-free"})
                 routes[model_id] = {
                     'name': name,
                     'base_url': base_url,
                     'api_key': upstream.get('api_key') or '',
+                    'pioneer_upstream': pioneer_router_listing,
                 }
                 upstream_model_count += 1
             log(
                 "model_directory upstream_loaded "
-                f"name={name} models={upstream_model_count} base_url={base_url}"
+                f"name={name} models={upstream_model_count} base_url={base_url} "
+                f"pioneer_upstream={str(pioneer_router_listing).lower()}"
             )
 
     deduped: list[dict[str, object]] = []
@@ -963,10 +1091,15 @@ def schedule_delayed_restart(delay: float = 2.0):
 
 # 请求/响应日志目录
 LOG_DIR = os.environ.get('LOG_DIR', './logs')
-CLAUDE_REPLAY_CONTROL_FILE = os.environ.get(
-    'CLAUDE_REPLAY_CONTROL_FILE',
-    os.path.join(LOG_DIR, 'claude_replay_switch.json'),
+REPLAY_CONTROL_FILE = os.environ.get(
+    'REPLAY_CONTROL_FILE',
+    os.environ.get(
+        'CLAUDE_REPLAY_CONTROL_FILE',
+        os.path.join(LOG_DIR, 'claude_replay_switch.json'),
+    ),
 )
+# Backward-compatible configuration name.
+CLAUDE_REPLAY_CONTROL_FILE = REPLAY_CONTROL_FILE
 
 proxy_logger = ProxyLogger(debug=DEBUG, log_dir=LOG_DIR)
 active_stream_registry = ActiveStreamRegistry(log=proxy_logger.log)
@@ -980,13 +1113,10 @@ active_stream_registry = ActiveStreamRegistry(log=proxy_logger.log)
 # same exact payload upstream more than once and let later retries wait for, or
 # briefly replay, the first result.
 NONSTREAM_DEDUPE_TTL = float(os.environ.get('NONSTREAM_DEDUPE_TTL', '180'))
-_nonstream_dedupe_lock = asyncio.Lock()
-_nonstream_inflight: dict[str, dict[str, Any]] = {}
-_nonstream_recent_results: dict[str, dict[str, Any]] = {}
 
 model_policy = ModelPolicy(
     codex_models=frozenset(),
-    allowed_gpt_models=frozenset({'gpt-5.4', 'gpt-5.4-pro'}),
+    allowed_gpt_models=frozenset({'gpt-5.6-sol'}),
     allowed_gemini_models=frozenset({'gemini-3.1-pro-preview', 'gemini-3-flash-preview'}),
     allowed_claude_models=frozenset({
         'claude-fable-5',
@@ -1001,6 +1131,12 @@ model_policy = ModelPolicy(
 
 def log(msg: str):
     proxy_logger.log(msg)
+
+
+nonstream_coalescer = ExactRequestCoalescer(
+    ttl=NONSTREAM_DEDUPE_TTL,
+    log=log,
+)
 
 
 runtime_flags = RuntimeFlags(
@@ -1036,11 +1172,13 @@ def has_stop_tag(text: str) -> bool:
 
 
 
-claude_replay = ClaudeReplayStore(
+replay_store = ReplayStore(
     log_dir=LOG_DIR,
-    control_file=CLAUDE_REPLAY_CONTROL_FILE,
+    control_file=REPLAY_CONTROL_FILE,
     log=log,
 )
+# Compatibility alias for the existing admin endpoint and external imports.
+claude_replay = replay_store
 
 
 
@@ -1053,7 +1191,12 @@ def fmt_ms(start: float, end: float | None = None) -> str:
     return proxy_logger.fmt_ms(start, end)
 
 
-app.add_middleware(ASGIWiretapMiddleware, log=log, fmt_ms=fmt_ms)
+app.add_middleware(
+    ASGIWiretapMiddleware,
+    log=log,
+    fmt_ms=fmt_ms,
+    release_trace=active_stream_registry.release_trace,
+)
 
 
 def save_request_log(
@@ -1086,13 +1229,16 @@ def release_active_stream_caller(caller_key: str, trace_id: str) -> None:
     active_stream_registry.release(caller_key, trace_id)
 
 
+replay_service = ReplayService(
+    store=replay_store,
+    log=log,
+    save_request_log=save_request_log,
+    release_caller=release_active_stream_caller,
+)
+
+
 def build_exact_request_key(request_payload: dict) -> str:
-    body = json.dumps(request_payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(body.encode('utf-8', errors='replace')).hexdigest()
-
-
-def clone_jsonable(value: Any) -> Any:
-    return copy.deepcopy(value)
+    return nonstream_coalescer.build_key(request_payload)
 
 
 def extract_openai_chat_payload_content(payload: dict) -> str:
@@ -1120,16 +1266,6 @@ def extract_openai_chat_payload_content(payload: dict) -> str:
         return ''
 
 
-def _cleanup_nonstream_dedupe(now: float) -> None:
-    expired = [
-        key
-        for key, item in _nonstream_recent_results.items()
-        if now - float(item.get('stored_at') or 0.0) > NONSTREAM_DEDUPE_TTL
-    ]
-    for key in expired:
-        _nonstream_recent_results.pop(key, None)
-
-
 async def run_exact_nonstream_once(
     *,
     dedupe_key: str,
@@ -1137,79 +1273,12 @@ async def run_exact_nonstream_once(
     upstream_label: str,
     runner,
 ) -> tuple[dict, bool]:
-    """Run an exact non-stream request once across concurrent retries.
-
-    Returns (payload, shared), where shared=True means this request reused an
-    in-flight or very recent identical result instead of calling upstream again.
-    """
-    trace_prefix = f"[TRACE {trace_id}]"
-    now = time.monotonic()
-    leader = False
-    waiter_count = 0
-
-    async with _nonstream_dedupe_lock:
-        _cleanup_nonstream_dedupe(now)
-        recent = _nonstream_recent_results.get(dedupe_key)
-        if recent:
-            age = now - float(recent.get('stored_at') or now)
-            log(
-                f"{trace_prefix} nonstream_dedupe_recent_hit "
-                f"upstream={upstream_label} key={dedupe_key[:16]} age={age:.1f}s"
-            )
-            return clone_jsonable(recent['payload']), True
-
-        entry = _nonstream_inflight.get(dedupe_key)
-        if entry is None:
-            task = asyncio.create_task(runner())
-            _nonstream_inflight[dedupe_key] = {
-                'task': task,
-                'trace_id': trace_id,
-                'started_at': now,
-                'waiters': 0,
-                'upstream': upstream_label,
-            }
-            leader = True
-            log(
-                f"{trace_prefix} nonstream_dedupe_leader "
-                f"upstream={upstream_label} key={dedupe_key[:16]}"
-            )
-        else:
-            task = entry['task']
-            entry['waiters'] = int(entry.get('waiters') or 0) + 1
-            waiter_count = int(entry.get('waiters') or 0)
-            age = now - float(entry.get('started_at') or now)
-            log(
-                f"{trace_prefix} nonstream_dedupe_wait "
-                f"upstream={upstream_label} key={dedupe_key[:16]} "
-                f"leader_trace={entry.get('trace_id')} age={age:.1f}s waiters={waiter_count}"
-            )
-
-    try:
-        result = await asyncio.shield(task)
-    except Exception:
-        async with _nonstream_dedupe_lock:
-            current = _nonstream_inflight.get(dedupe_key)
-            if current and current.get('task') is task:
-                _nonstream_inflight.pop(dedupe_key, None)
-        raise
-
-    async with _nonstream_dedupe_lock:
-        current = _nonstream_inflight.get(dedupe_key)
-        if current and current.get('task') is task:
-            _nonstream_inflight.pop(dedupe_key, None)
-            _nonstream_recent_results[dedupe_key] = {
-                'payload': clone_jsonable(result),
-                'stored_at': time.monotonic(),
-                'trace_id': trace_id,
-                'upstream': upstream_label,
-            }
-            log(
-                f"{trace_prefix} nonstream_dedupe_store "
-                f"upstream={upstream_label} key={dedupe_key[:16]} "
-                f"waiters={current.get('waiters', 0)}"
-            )
-
-    return clone_jsonable(result), not leader
+    return await nonstream_coalescer.run(
+        dedupe_key=dedupe_key,
+        trace_id=trace_id,
+        upstream_label=upstream_label,
+        runner=runner,
+    )
 
 
 
@@ -1583,1521 +1652,10 @@ def build_gemini_upstream_deps() -> GeminiUpstreamDeps:
     )
 
 
-# ============================================================
-# 路由：Anthropic Messages API 透传 (/v1/messages)
-# ============================================================
-
-@app.post('/v1/messages')
-async def anthropic_messages(request: Request):
-    """Anthropic Messages API 透传。"""
-    data = None
-    trace_id = getattr(request.state, 'trace_id', None) or request.headers.get('x-request-id') or uuid.uuid4().hex[:8]
-    try:
-        data = await request.json()
-        if should_strip_claude_cache_controls():
-            data = strip_claude_cache_controls(data)
-        model = data.get('model', '')
-        stream = data.get('stream', False)
-        removed_fields = model_policy.apply_claude_sampling_compat(data)
-
-        if not model_policy.is_model_allowed(model):
-            save_request_log(
-                model,
-                data.get('messages', []),
-                f"[REJECTED] Model disabled by proxy: {model}",
-                stream=bool(stream),
-                request_payload=data,
-                error_type="invalid_model",
-                trace_id=trace_id,
-            )
-            return JSONResponse(
-                {"type": "error", "error": {"type": "invalid_model", "message": f"Model disabled by proxy: {model}"}},
-                status_code=400
-            )
-
-        if removed_fields:
-            log(
-                "Anthropic passthrough: "
-                f"removed={','.join(sorted(removed_fields))} "
-                "for Claude sampling compatibility"
-            )
-        log(f"Anthropic passthrough: model={model}, stream={stream}")
-
-        # NewAPI 已移除：Anthropic Messages 透传改为直连 Claude 上游。
-        msg_provider, msg_real_model, _ = parse_claude_provider_prefix(model)
-        msg_api_key, msg_base_url = get_claude_upstream_for_provider(msg_provider)
-        if msg_provider:
-            model = msg_real_model
-            data['model'] = model
-            log(f"Anthropic passthrough: claude_provider={msg_provider} real_model={model}")
-        if not msg_api_key:
-            missing_label = f"CLAUDE2_API_KEY (codecli)" if msg_provider == 'codecli' else "CLAUDE_API_KEY"
-            return JSONResponse(
-                {"type": "error", "error": {"type": "config_error", "message": f"{missing_label} is missing"}},
-                status_code=500,
-            )
-        claude_session_id = extract_claude_session_id(data.get('metadata'))
-        forward_headers = build_claude_upstream_headers(
-            session_id=claude_session_id,
-            model=model,
-            api_key=msg_api_key,
-        )
-        target_url = build_claude_messages_url(base_url=msg_base_url)
-
-        if stream:
-            # 流式：透传
-            return StreamingResponse(
-                forward_anthropic_stream(
-                    url=target_url,
-                    request_data=data,
-                    headers=forward_headers,
-                    timeout=get_timeout_config(),
-                    deps=build_anthropic_upstream_deps(),
-                    enable_early_stop=False,
-                    trace_id=trace_id,
-                ),
-                media_type='text/event-stream'
-            )
-
-        # 非流式：内部仍走上游流式，再聚合回标准 Anthropic JSON
-        try:
-            resp_data, raw_sse = await collect_anthropic_message_response(
-                url=target_url,
-                request_data=data,
-                headers=forward_headers,
-                model=model,
-                timeout=get_timeout_config(),
-                max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                deps=build_anthropic_upstream_deps(),
-                trace_id=trace_id,
-            )
-            save_request_log(
-                model,
-                data.get('messages', []),
-                json.dumps(resp_data, ensure_ascii=False),
-                stream=bool(stream),
-                raw_sse=raw_sse,
-                request_payload=data,
-                trace_id=trace_id,
-            )
-            return JSONResponse(resp_data, status_code=200)
-        except Exception as e:
-            err_text = str(e)
-            save_request_log(
-                model,
-                data.get('messages', []),
-                f"[UPSTREAM_HTTP_ERROR] {err_text}",
-                stream=bool(stream),
-                request_payload=data,
-                error_type="upstream_http_error",
-                trace_id=trace_id,
-            )
-            return JSONResponse(
-                {"type": "error", "error": {"type": "upstream_http_error", "message": err_text}},
-                status_code=502,
-            )
-
-    except Exception as e:
-        log(f"Anthropic passthrough error: {e}")
-        if isinstance(data, dict):
-            save_request_log(
-                data.get('model', ''),
-                data.get('messages', []),
-                f"[EXCEPTION] {e}",
-                stream=bool(data.get('stream', False)),
-                request_payload=data,
-                error_type="proxy_error",
-                trace_id=trace_id,
-            )
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(
-            {"type": "error", "error": {"type": "proxy_error", "message": str(e)}},
-            status_code=500
-        )
-
-
-# ============================================================
-# 路由：OpenAI Chat Completions (/v1/chat/completions)
-# ============================================================
-
-@app.post('/v1/chat/completions')
-async def chat_completions(request: Request):
-    data = None
-    inbound_request = None
-    inbound_structure = None
-    trace_id = getattr(request.state, 'trace_id', None) or request.headers.get('x-request-id') or uuid.uuid4().hex[:8]
-    trace_prefix = f"[TRACE {trace_id}]"
-    route_t0 = time.perf_counter()
-    caller_key, caller_desc = build_caller_fingerprint(request)
-    try:
-        json_t0 = time.perf_counter()
-        data = await request.json()
-        inbound_request = copy.deepcopy(data)
-        inbound_structure = summarize_openai_messages(inbound_request.get('messages', []))
-        log(f"{trace_prefix} json_parsed elapsed={fmt_ms(json_t0)} since_enter={fmt_ms(route_t0)}")
-        log(
-            f"{trace_prefix} inbound_openai_structure "
-            f"{json.dumps(inbound_structure[:12], ensure_ascii=False)}"
-        )
-        model = data.get('model', '')
-        stream = data.get('stream', False)
-        removed_fields = model_policy.apply_claude_sampling_compat(data)
-        msg_count = len(data.get('messages', []))
-        payload_sig = (
-            f"model={model} stream={stream} msgs={msg_count} "
-            f"cl={request.headers.get('content-length', '-')}"
-        )
-        if removed_fields:
-            log(
-                f"{trace_prefix} claude_sampling_compat "
-                f"removed={','.join(sorted(removed_fields))}"
-            )
-        log(f"{trace_prefix} caller={caller_key} {caller_desc}")
-        log(f"{trace_prefix} request_meta {payload_sig}")
-
-        if stream:
-            prev = active_stream_registry.get(caller_key)
-            if prev and prev.get('trace_id') != trace_id:
-                prev_age = time.time() - prev.get('started_at', time.time())
-                log(
-                    f"{trace_prefix} caller_overlap caller={caller_key} "
-                    f"prev_trace={prev.get('trace_id')} prev_age={prev_age:.1f}s "
-                    f"prev_model={prev.get('model')} prev_msgs={prev.get('msg_count')} "
-                    f"note=new stream from same caller may cancel previous stream"
-                )
-            active_stream_registry.register(
-                caller_key,
-                trace_id=trace_id,
-                model=model,
-                msg_count=msg_count,
-            )
-
-        if str(model).startswith("fake-slow-stream"):
-            fake_chunks = int(data.get('fake_chunks') or 1200)
-            fake_delay = float(data.get('fake_delay') or 0.5)
-            fake_token = str(data.get('fake_token') or '假流')
-            log(
-                f"{trace_prefix} Route to local fake slow stream "
-                f"model={model} chunks={fake_chunks} delay={fake_delay} since_enter={fmt_ms(route_t0)}"
-            )
-            if stream:
-                return StreamingResponse(
-                    fake_slow_openai_stream(
-                        model=str(model),
-                        trace_id=trace_id,
-                        chunks=fake_chunks,
-                        delay=fake_delay,
-                        token=fake_token,
-                    ),
-                    media_type='text/event-stream',
-                )
-            return JSONResponse({
-                "id": f"chatcmpl-fake-{uuid.uuid4().hex[:16]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": fake_token},
-                    "finish_reason": "stop",
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            })
-
-        if not model_policy.is_model_allowed(model):
-            save_request_log(
-                model,
-                data.get('messages', []),
-                f"[REJECTED] Model disabled by proxy: {model}",
-                stream=bool(stream),
-                request_payload=data,
-                error_type="invalid_model",
-                trace_id=trace_id,
-            )
-            return JSONResponse(
-                {"error": {"message": f"Model disabled by proxy: {model}", "type": "invalid_model"}},
-                status_code=400
-            )
-
-        directory_route = await resolve_openai_compatible_route(
-            model,
-            request_authorization=request.headers.get('authorization', ''),
-        )
-        if directory_route:
-            route_name = directory_route.get('name') or 'openai-compatible'
-            base_url = str(directory_route.get('base_url') or '').rstrip('/')
-            target_url = f"{base_url}/chat/completions"
-            outbound_data = copy.deepcopy(data)
-            if should_append_pro_opus46_last_user_note(route_name, base_url, model):
-                illustrated = insert_after_latest_human_message(
-                    outbound_data.get('messages', []),
-                    PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
-                    PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
-                )
-                if illustrated:
-                    log(f"{trace_prefix} pro_opus46_latest_human_illustration inserted name={route_name} model={model}")
-                else:
-                    log(f"{trace_prefix} pro_opus46_latest_human_illustration skipped name={route_name} model={model}")
-                injected = append_to_last_user_message(
-                    outbound_data.get('messages', []),
-                    PRO_OPUS46_LAST_USER_APPEND_TEXT,
-                    PRO_OPUS46_LAST_USER_APPEND_MARKER,
-                )
-                if injected:
-                    log(f"{trace_prefix} pro_opus46_last_user_note appended name={route_name} model={model}")
-                else:
-                    log(f"{trace_prefix} pro_opus46_last_user_note skipped name={route_name} model={model}")
-            if should_apply_deepseek_drawing_context_filter(route_name, base_url):
-                filter_stats = apply_drawing_context_filter(outbound_data)
-                if filter_stats.get('blocks'):
-                    log(
-                        f"{trace_prefix} ds_drawing_context_filter "
-                        f"name={route_name} messages={filter_stats['messages']} "
-                        f"blocks={filter_stats['blocks']} chars={filter_stats['chars']} "
-                        f"mode=closed_tags_and_bare_image_prompts"
-                    )
-            if model_policy.is_gemini_model(model):
-                filter_stats = apply_drawing_context_filter(outbound_data)
-                if filter_stats.get('blocks'):
-                    log(
-                        f"{trace_prefix} pro_gemini_drawing_context_filter "
-                        f"name={route_name} model={model} messages={filter_stats['messages']} "
-                        f"blocks={filter_stats['blocks']} chars={filter_stats['chars']} "
-                        f"mode=closed_tags_and_bare_image_prompts"
-                    )
-            no_reasoning_meta = apply_pro_no_reasoning_payload(outbound_data, route_name, base_url)
-            if no_reasoning_meta:
-                log(
-                    f"{trace_prefix} pro_no_reasoning_payload "
-                    f"name={route_name} model={model} "
-                    f"reasoning_effort={no_reasoning_meta.get('reasoning_effort')} "
-                    f"removed={','.join(no_reasoning_meta.get('removed') or []) or '-'}"
-                )
-            headers = {
-                'Content-Type': 'application/json',
-            }
-            route_key = str(directory_route.get('api_key') or '').strip()
-            if route_key:
-                headers['Authorization'] = f'Bearer {route_key}'
-            else:
-                inbound_auth = request.headers.get('authorization')
-                if inbound_auth:
-                    headers['Authorization'] = inbound_auth
-            log(
-                f"{trace_prefix} Route to model-directory upstream "
-                f"name={route_name} model={model} url={target_url} since_enter={fmt_ms(route_t0)}"
-            )
-
-            replay_spec = claude_replay.load_spec(
-                model=model,
-                messages=data.get('messages', []),
-            )
-            if replay_spec:
-                log(
-                    f"{trace_prefix} model-directory OpenAI replay armed "
-                    f"name={route_name} mode={replay_spec['mode']} "
-                    f"file={replay_spec['raw_sse_path']} since_enter={fmt_ms(route_t0)}"
-                )
-
-            if stream:
-                pro_gemini_nonstream_replay = bool(model_policy.is_gemini_model(model))
-                outbound_data['stream'] = False if pro_gemini_nonstream_replay else True
-                if replay_spec:
-                    claude_replay.consume_if_needed(replay_spec)
-                    return StreamingResponse(
-                        replay_openai_chat_stream(
-                            raw_sse_text=replay_spec['raw_sse_text'],
-                            request_data=outbound_data,
-                            model=model,
-                            messages=data.get('messages', []),
-                            trace_id=trace_id,
-                            caller_key=caller_key,
-                            caller_desc=caller_desc,
-                            deps=build_openai_upstream_deps(),
-                            enable_early_stop=False,
-                        ),
-                        media_type='text/event-stream'
-                    )
-
-                if pro_gemini_nonstream_replay:
-                    log(
-                        f"{trace_prefix} model-directory pro_gemini stream_to_nonstream_replay "
-                        f"name={route_name} model={model}"
-                    )
-                    return StreamingResponse(
-                        forward_non_stream_as_openai_stream(
-                            url=target_url,
-                            request_data=outbound_data,
-                            headers=headers,
-                            timeout=get_timeout_config(),
-                            deps=build_openai_upstream_deps(),
-                            model=model,
-                            messages=data.get('messages', []),
-                            trace_id=trace_id,
-                            caller_key=caller_key,
-                            caller_desc=caller_desc,
-                        ),
-                        media_type='text/event-stream'
-                    )
-
-                return StreamingResponse(
-                    forward_stream(
-                        url=target_url,
-                        request_data=outbound_data,
-                        headers=headers,
-                        timeout=get_timeout_config(),
-                        max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                        deps=build_openai_upstream_deps(),
-                        enable_early_stop=False,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        caller_key=caller_key,
-                        caller_desc=caller_desc,
-                    ),
-                    media_type='text/event-stream'
-                )
-
-            try:
-                use_plain_non_stream = bool(model_policy.is_gemini_model(model))
-                upstream_nonstream_payload = None
-                if use_plain_non_stream:
-                    outbound_data['stream'] = False
-                    dedupe_key = build_exact_request_key(outbound_data)
-                    log(
-                        f"{trace_prefix} model-directory Gemini nonstream passthrough "
-                        f"name={route_name} model={model} key={dedupe_key[:16]}"
-                    )
-
-                    async def _run_plain_nonstream():
-                        collected = await collect_non_stream(
-                            url=target_url,
-                            request_data=outbound_data,
-                            headers=headers,
-                            timeout=get_timeout_config(),
-                            deps=build_openai_upstream_deps(),
-                            trace_id=trace_id,
-                        )
-                        return collected[5]
-
-                    upstream_nonstream_payload, dedupe_shared = await run_exact_nonstream_once(
-                        dedupe_key=dedupe_key,
-                        trace_id=trace_id,
-                        upstream_label=f"{route_name}:{model}",
-                        runner=_run_plain_nonstream,
-                    )
-                    full_content = extract_openai_chat_payload_content(upstream_nonstream_payload)
-                    model_name = str(upstream_nonstream_payload.get("model") or model)
-                    usage = upstream_nonstream_payload.get("usage") if isinstance(upstream_nonstream_payload.get("usage"), dict) else {}
-                    finish_reason = "stop"
-                    try:
-                        choices = upstream_nonstream_payload.get("choices")
-                        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                            finish_reason = str(choices[0].get("finish_reason") or "stop")
-                    except Exception:
-                        pass
-                    raw_response = json.dumps(upstream_nonstream_payload, ensure_ascii=False)
-                    if dedupe_shared:
-                        log(
-                            f"{trace_prefix} nonstream_dedupe_return_shared "
-                            f"key={dedupe_key[:16]} out_chars={len(full_content)}"
-                        )
-                else:
-                    full_content, model_name, usage, finish_reason, raw_response = await collect_stream(
-                        url=target_url,
-                        request_data=outbound_data,
-                        headers=headers,
-                        timeout=get_timeout_config(),
-                        max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                        deps=build_openai_upstream_deps(),
-                        enable_early_stop=False,
-                        trace_id=trace_id,
-                    )
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    full_content,
-                    stream=False,
-                    raw_sse="" if use_plain_non_stream else raw_response,
-                    request_payload=outbound_data,
-                    trace_id=trace_id,
-                )
-                if use_plain_non_stream and isinstance(upstream_nonstream_payload, dict):
-                    log(
-                        f"{trace_prefix} model-directory Gemini nonstream return_shape "
-                        f"keys={list(upstream_nonstream_payload.keys())[:12]} "
-                        f"choices_type={type(upstream_nonstream_payload.get('choices')).__name__} "
-                        f"has_content={'content' in upstream_nonstream_payload} "
-                        f"has_message={'message' in upstream_nonstream_payload}"
-                    )
-                    return JSONResponse(upstream_nonstream_payload)
-                return JSONResponse({
-                    "id": f"chatcmpl-{uuid.uuid4()}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model_name or model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": full_content
-                        },
-                        "finish_reason": finish_reason
-                    }],
-                    "usage": usage or {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0
-                    }
-                })
-            except Exception as e:
-                log(f"{trace_prefix} model-directory collect error upstream={route_name}: {e}")
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    f"[ERROR] {e}",
-                    stream=False,
-                    request_payload=outbound_data,
-                    error_type="model_directory_upstream_error",
-                    trace_id=trace_id,
-                )
-                return JSONResponse(
-                    {"error": {"message": str(e), "type": "model_directory_upstream_error"}},
-                    status_code=502
-                )
-
-        # Gemini 模型：直接 HTTP 直连（不再依赖 gemini-proxy）
-        if model_policy.is_gemini_model(model):
-            if not GEMINI_ENABLED:
-                return JSONResponse(
-                    {"error": {"message": "Gemini is temporarily disabled by proxy", "type": "service_unavailable"}},
-                    status_code=503
-                )
-
-            replay_spec = claude_replay.load_spec(
-                model=model,
-                messages=data.get('messages', []),
-            )
-            if replay_spec:
-                log(
-                    f"{trace_prefix} Gemini replay armed "
-                    f"mode={replay_spec['mode']} file={replay_spec['raw_sse_path']} "
-                    f"since_enter={fmt_ms(route_t0)}"
-                )
-                if stream:
-                    data = dict(data)
-                    data['stream'] = True
-                    claude_replay.consume_if_needed(replay_spec)
-                    return StreamingResponse(
-                        replay_anthropic_chat_stream(
-                            raw_sse_text=replay_spec['raw_sse_text'],
-                            request_data=data,
-                            model=model,
-                            messages=data.get('messages', []),
-                            trace_id=trace_id,
-                            caller_key=caller_key,
-                            caller_desc=caller_desc,
-                            deps=build_anthropic_upstream_deps(),
-                        ),
-                        media_type='text/event-stream'
-                    )
-
-                try:
-                    replay_request = dict(data)
-                    replay_request['stream'] = True
-                    claude_replay.consume_if_needed(replay_spec)
-                    full_content, model_name, usage, finish_reason, _raw_response = await collect_anthropic_chat_completion_from_raw_sse(
-                        raw_sse_text=replay_spec['raw_sse_text'],
-                        request_data=replay_request,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        deps=build_anthropic_upstream_deps(),
-                    )
-                    save_request_log(
-                        model_name,
-                        data.get('messages', []),
-                        full_content,
-                        stream=False,
-                        raw_sse=replay_spec['raw_sse_text'],
-                        request_payload=data,
-                        trace_id=trace_id,
-                    )
-                    return JSONResponse({
-                        "id": f"chatcmpl-{uuid.uuid4()}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": full_content
-                            },
-                            "finish_reason": finish_reason
-                        }],
-                        "usage": usage or {
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0
-                        }
-                    })
-                except Exception as e:
-                    log(f"{trace_prefix} Gemini replay collect error: {e}")
-                    save_request_log(
-                        model,
-                        data.get('messages', []),
-                        f"[ERROR] {e}",
-                        stream=False,
-                        request_payload=data,
-                        error_type="gemini_replay_error",
-                        trace_id=trace_id,
-                    )
-                    return JSONResponse(
-                        {"error": {"message": str(e), "type": "gemini_replay_error"}},
-                        status_code=502
-                    )
-
-            log(f"{trace_prefix} Route to Gemini HTTP: {model} since_enter={fmt_ms(route_t0)}")
-            if not GEMINI_API_KEY:
-                return JSONResponse(
-                    {"error": {"message": "GEMINI_API_KEY is missing", "type": "config_error"}},
-                    status_code=500
-                )
-            data = copy.deepcopy(data)
-            filter_stats = apply_drawing_context_filter(data)
-            if filter_stats.get('blocks'):
-                log(
-                    f"{trace_prefix} gemini_drawing_context_filter "
-                    f"model={model} messages={filter_stats['messages']} "
-                    f"blocks={filter_stats['blocks']} chars={filter_stats['chars']} "
-                    f"mode=closed_tags_and_bare_image_prompts"
-                )
-            gemini_config = build_gemini_upstream_config()
-            gemini_deps = build_gemini_upstream_deps()
-
-            if stream:
-                data['stream'] = True
-                return StreamingResponse(
-                    forward_gemini_stream(
-                        model=model,
-                        openai_request=data,
-                        config=gemini_config,
-                        deps=gemini_deps,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                    ),
-                    media_type='text/event-stream'
-                )
-
-            try:
-                data['stream'] = False
-                dedupe_key = build_exact_request_key(data)
-
-                async def _run_gemini_nonstream():
-                    full_content_inner, usage_inner, finish_reason_inner = await collect_gemini_non_stream(
-                        model=model,
-                        openai_request=data,
-                        config=gemini_config,
-                        deps=gemini_deps,
-                        trace_id=trace_id,
-                    )
-                    return {
-                        "id": f"chatcmpl-{uuid.uuid4()}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": full_content_inner
-                            },
-                            "finish_reason": finish_reason_inner
-                        }],
-                        "usage": usage_inner or {
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0
-                        }
-                    }
-
-                response_payload, dedupe_shared = await run_exact_nonstream_once(
-                    dedupe_key=dedupe_key,
-                    trace_id=trace_id,
-                    upstream_label=f"gemini-http:{model}",
-                    runner=_run_gemini_nonstream,
-                )
-                full_content = extract_openai_chat_payload_content(response_payload)
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    full_content,
-                    stream=False,
-                    request_payload=data,
-                    trace_id=trace_id,
-                )
-                if dedupe_shared:
-                    log(
-                        f"{trace_prefix} nonstream_dedupe_return_shared "
-                        f"key={dedupe_key[:16]} out_chars={len(full_content)}"
-                    )
-                return JSONResponse(response_payload)
-            except Exception as e:
-                log(f"Gemini collect error: {e}")
-                schedule_delayed_restart()
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    f"[ERROR] {e}",
-                    stream=False,
-                    request_payload=data,
-                    error_type="gemini_upstream_error",
-                    trace_id=trace_id,
-                )
-                return JSONResponse(
-                    {"error": {"message": str(e), "type": "gemini_upstream_error"}},
-                    status_code=502
-                )
-
-        if model_policy.is_claude_model(model):
-            claude_provider, claude_real_model, claude_display = parse_claude_provider_prefix(model)
-            claude_upstream_key, claude_upstream_base = get_claude_upstream_for_provider(claude_provider)
-            if not claude_upstream_key:
-                if stream:
-                    release_active_stream_caller(caller_key, trace_id)
-                missing_label = f"CLAUDE2_API_KEY (codecli)" if claude_provider == 'codecli' else "CLAUDE_API_KEY"
-                return JSONResponse(
-                    {"error": {"message": f"{missing_label} is missing", "type": "config_error"}},
-                    status_code=500
-                )
-            # Use real model name (without prefix) for upstream requests
-            if claude_provider:
-                model = claude_real_model
-                data = copy.deepcopy(data)
-                data['model'] = model
-                log(f"{trace_prefix} claude_provider={claude_provider} real_model={model}")
-
-            if is_claude_haiku_model(model):
-                data = copy.deepcopy(data)
-                filter_stats = apply_drawing_context_filter(data)
-                if filter_stats.get('blocks'):
-                    log(
-                        f"{trace_prefix} haiku_drawing_context_filter "
-                        f"model={model} messages={filter_stats['messages']} "
-                        f"blocks={filter_stats['blocks']} chars={filter_stats['chars']} "
-                        f"mode=closed_tags_and_bare_image_prompts"
-                    )
-
-            if should_strip_claude_cache_controls():
-                data = strip_claude_cache_controls(data)
-
-            data = copy.deepcopy(data)
-            if is_claude_opus_model(model):
-                illustrated = insert_after_latest_human_message(
-                    data.get('messages', []),
-                    PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
-                    PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
-                )
-                if illustrated:
-                    log(f"{trace_prefix} claude_code_latest_human_illustration inserted model={model}")
-                else:
-                    log(f"{trace_prefix} claude_code_latest_human_illustration skipped model={model}")
-                injected = append_to_last_user_message(
-                    data.get('messages', []),
-                    PRO_OPUS_LAST_USER_APPEND_TEXT,
-                    PRO_OPUS_LAST_USER_APPEND_MARKER,
-                )
-                if injected:
-                    log(f"{trace_prefix} claude_code_last_user_note appended model={model}")
-                else:
-                    log(f"{trace_prefix} claude_code_last_user_note skipped model={model}")
-            else:
-                log(f"{trace_prefix} claude_code_last_user_note skipped_non_opus model={model}")
-
-            claude_metadata_user_id, claude_session_id, claude_session_mode, claude_session_ttl_sec, claude_session_key = build_timed_claude_user_id(
-                model=model,
-                provider=claude_provider or 'default',
-            )
-            prompt_cache_cfg = get_claude_prompt_caching_settings()
-            prompt_cache_enabled_for_model = bool(
-                prompt_cache_cfg.get('enabled') and is_claude_prompt_cache_model(model)
-            )
-            prompt_cache_keepalive_cfg = get_claude_cache_keepalive_settings()
-            prompt_cache_keepalive_enabled_for_model = bool(
-                prompt_cache_enabled_for_model and prompt_cache_keepalive_cfg.get('enabled')
-            )
-            prompt_cache_control = build_claude_prompt_cache_control() if prompt_cache_enabled_for_model else None
-            prompt_cache_strategy = (
-                'sonnet_fill_table' if is_claude_sonnet_model(model)
-                else 'opus_roleplay_layered' if is_claude_opus_model(model)
-                else 'generic'
-            )
-            claude_request = convert_chat_to_anthropic_messages_request(
-                data,
-                system_prefix=build_claude_system_prefix(model),
-                metadata_user_id=claude_metadata_user_id,
-                default_max_tokens=CLAUDE_DEFAULT_MAX_TOKENS,
-                prompt_cache_control=prompt_cache_control if prompt_cache_enabled_for_model and prompt_cache_cfg.get('mode') == 'explicit' else None,
-                prompt_cache_strategy=prompt_cache_strategy,
-            )
-            if prompt_cache_enabled_for_model and prompt_cache_cfg.get('mode') == 'automatic' and isinstance(prompt_cache_control, dict):
-                claude_request['cache_control'] = dict(prompt_cache_control)
-            claude_request = apply_claude_output_settings(claude_request)
-            claude_request, keyword_filter_stats = apply_claude_keyword_filter(claude_request)
-            claude_request, compat_meta = apply_claude_client_compat_request(claude_request)
-            claude_request, model_compat_meta = apply_claude_model_compat_request(claude_request)
-            for key, value in model_compat_meta.items():
-                compat_meta[f'model_{key}'] = value
-            if should_strip_claude_cache_controls() and is_claude_haiku_model(model):
-                claude_request = strip_claude_cache_controls(claude_request)
-                compat_meta['cache_control'] = 'stripped'
-            elif should_strip_claude_cache_controls():
-                compat_meta['cache_control'] = 'preserved_agent_system'
-            claude_structure = summarize_anthropic_request(claude_request)
-            claude_cache_breakpoint_layout = summarize_anthropic_cache_breakpoints(claude_request)
-            claude_headers = build_claude_upstream_headers(
-                session_id=claude_session_id,
-                model=claude_request.get('model'),
-                api_key=claude_upstream_key,
-            )
-            claude_url = build_claude_messages_url(base_url=claude_upstream_base)
-            replay_spec = claude_replay.load_spec(
-                model=model,
-                messages=data.get('messages', []),
-            )
-
-            log(
-                "Claude messages shim: "
-                f"model={model}, "
-                f"anthropic_msgs={len(claude_request.get('messages', []))}, "
-                f"system_blocks={len(claude_request.get('system', [])) if isinstance(claude_request.get('system'), list) else 0}, "
-                f"max_tokens={claude_request.get('max_tokens')}, "
-                f"output_effort={(claude_request.get('output_config') or {}).get('effort', '-')}, "
-                f"compat_tools={compat_meta.get('tools')}, "
-                f"compat_thinking={compat_meta.get('thinking')}, "
-                f"compat_ctx={compat_meta.get('context_management')}, "
-                f"session={claude_session_mode}:{claude_session_id[:8]}, "
-                f"session_key={claude_session_key}, "
-                f"session_ttl={claude_session_ttl_sec:.0f}s, "
-                f"cache_mode={prompt_cache_cfg.get('mode') if prompt_cache_enabled_for_model else 'off'}, "
-                f"cache_strategy={prompt_cache_strategy if prompt_cache_enabled_for_model else '-'}, "
-                f"cache_keepalive={'on' if prompt_cache_keepalive_enabled_for_model else 'off'}, "
-                f"top_cache={'yes' if isinstance(claude_request.get('cache_control'), dict) else 'no'}, "
-                f"cache_breakpoints={sum(1 for item in claude_structure.get('system_blocks', []) if item.get('has_cache_control')) + sum(item.get('cache_control_blocks', 0) for item in claude_structure.get('messages', []))}"
-            )
-            if prompt_cache_enabled_for_model:
-                log(
-                    f"{trace_prefix}Claude cache breakpoint layout: "
-                    f"{json.dumps(claude_cache_breakpoint_layout, ensure_ascii=False, separators=(',', ':'))}"
-                )
-            if int(keyword_filter_stats.get('total_removed', 0) or 0) > 0:
-                log(
-                    f"{trace_prefix} Claude keyword filter "
-                    f"removed={json.dumps(keyword_filter_stats.get('removed_keywords', {}), ensure_ascii=False)} "
-                    f"touched_paths={json.dumps(keyword_filter_stats.get('touched_paths', []), ensure_ascii=False)}"
-                )
-            log(f"{trace_prefix} Route to Claude upstream /v1/messages: {model} since_enter={fmt_ms(route_t0)}")
-            if replay_spec:
-                log(
-                    f"{trace_prefix} Claude replay armed "
-                    f"mode={replay_spec['mode']} file={replay_spec['raw_sse_path']}"
-                )
-
-            if stream:
-                claude_request = dict(claude_request)
-                claude_request['stream'] = True
-                if is_claude_haiku_model(model):
-                    claude_request, system_fold_meta = fold_claude_system_into_first_user_message(claude_request)
-                    if system_fold_meta.get('action') != 'absent':
-                        log(
-                            f"{trace_prefix} Claude stream system fold "
-                            f"action={system_fold_meta.get('action')} "
-                            f"blocks={system_fold_meta.get('blocks')} "
-                            f"chars={system_fold_meta.get('chars')}"
-                        )
-                if replay_spec:
-                    claude_replay.consume_if_needed(replay_spec)
-                    return StreamingResponse(
-                        replay_anthropic_chat_stream(
-                            raw_sse_text=replay_spec['raw_sse_text'],
-                            request_data=claude_request,
-                            model=model,
-                            messages=data.get('messages', []),
-                            trace_id=trace_id,
-                            caller_key=caller_key,
-                            caller_desc=caller_desc,
-                            deps=build_anthropic_upstream_deps(),
-                        ),
-                        media_type='text/event-stream'
-                    )
-                return StreamingResponse(
-                    forward_anthropic_chat_stream(
-                        url=claude_url,
-                        request_data=claude_request,
-                        headers=claude_headers,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        caller_key=caller_key,
-                        caller_desc=caller_desc,
-                        timeout=get_timeout_config(),
-                        max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                        deps=build_anthropic_upstream_deps(),
-                        cache_keepalive=prompt_cache_keepalive_cfg if prompt_cache_keepalive_enabled_for_model else None,
-                    ),
-                    media_type='text/event-stream'
-                )
-
-            try:
-                claude_request = dict(claude_request)
-                claude_request['stream'] = True
-                if is_claude_haiku_model(model):
-                    claude_request, system_fold_meta = fold_claude_system_into_first_user_message(claude_request)
-                    if system_fold_meta.get('action') != 'absent':
-                        log(
-                            f"{trace_prefix} Claude collect system fold "
-                            f"action={system_fold_meta.get('action')} "
-                            f"blocks={system_fold_meta.get('blocks')} "
-                            f"chars={system_fold_meta.get('chars')}"
-                        )
-                if replay_spec:
-                    claude_replay.consume_if_needed(replay_spec)
-                    full_content, model_name, usage, finish_reason, raw_response = await collect_anthropic_chat_completion_from_raw_sse(
-                        raw_sse_text=replay_spec['raw_sse_text'],
-                        request_data=claude_request,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        deps=build_anthropic_upstream_deps(),
-                    )
-                else:
-                    full_content, model_name, usage, finish_reason, raw_response = await collect_anthropic_chat_completion(
-                        url=claude_url,
-                        request_data=claude_request,
-                        headers=claude_headers,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        timeout=get_timeout_config(),
-                        max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                        deps=build_anthropic_upstream_deps(),
-                    )
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    full_content,
-                    stream=False,
-                    raw_sse=raw_response,
-                    request_payload=claude_request,
-                    inbound_request_payload=inbound_request,
-                    debug_meta={
-                        "inbound_openai_structure": inbound_structure,
-                    },
-                    trace_id=trace_id,
-                )
-                return JSONResponse({
-                    "id": f"chatcmpl-{uuid.uuid4()}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model_name or model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": full_content
-                        },
-                        "finish_reason": finish_reason
-                    }],
-                    "usage": usage or {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0
-                    }
-                })
-            except Exception as e:
-                log(f"{trace_prefix} Claude collect error: {e}")
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    f"[ERROR] {e}",
-                    stream=False,
-                    request_payload=claude_request,
-                    inbound_request_payload=inbound_request,
-                    debug_meta={
-                        "inbound_openai_structure": inbound_structure,
-                    },
-                    error_type="claude_upstream_error",
-                    trace_id=trace_id,
-                )
-                return JSONResponse(
-                    {"error": {"message": str(e), "type": "claude_upstream_error"}},
-                    status_code=502
-                )
-
-        # GPT：对齐 Codex CLI，默认将 Chat Completions 入站转为 Responses 上游。
-        outbound_data = data
-
-        if model_policy.is_gpt_model(model):
-            outbound_data = inject_gpt_usage_policies_system_message(data)
-            log(f"{trace_prefix} gpt_usage_policies_system_injected first_system=yes")
-            if not CODEX_API_KEY:
-                if stream:
-                    release_active_stream_caller(caller_key, trace_id)
-                return JSONResponse(
-                    {"error": {"message": "CODEX_API_KEY is missing", "type": "config_error"}},
-                    status_code=500
-                )
-
-            if GPT_USE_RESPONSES:
-                outbound_data = convert_chat_to_responses_request(outbound_data)
-                outbound_data = dict(outbound_data)
-                outbound_data['stream'] = True
-                outbound_data.setdefault('store', False)
-                if GPT_SERVICE_TIER:
-                    outbound_data['service_tier'] = GPT_SERVICE_TIER
-                outbound_data.setdefault('prompt_cache_key', build_gpt_prompt_cache_key(model, outbound_data, GPT_PROMPT_CACHE_KEY))
-                if GPT_PROMPT_CACHE_RETENTION:
-                    outbound_data.setdefault('prompt_cache_retention', GPT_PROMPT_CACHE_RETENTION)
-                outbound_data.setdefault('reasoning', {})
-                if isinstance(outbound_data.get('reasoning'), dict):
-                    outbound_data['reasoning'].setdefault('effort', CODEX_REASONING_EFFORT)
-                    if CODEX_REASONING_SUMMARY:
-                        outbound_data['reasoning'].setdefault('summary', CODEX_REASONING_SUMMARY)
-
-                codex_deps = build_codex_upstream_deps()
-                log(
-                    f"{trace_prefix} Route to GPT Responses upstream /v1/responses: "
-                    f"{model} service_tier={outbound_data.get('service_tier', '-')} "
-                    f"prompt_cache_key={outbound_data.get('prompt_cache_key', '-')} "
-                    f"prompt_cache_retention={outbound_data.get('prompt_cache_retention', '-')} "
-                    f"reasoning_effort={(outbound_data.get('reasoning') or {}).get('effort', '-')} "
-                    f"input_items={len(outbound_data.get('input', []))} "
-                    f"instructions={'yes' if outbound_data.get('instructions') else 'no'} "
-                    f"since_enter={fmt_ms(route_t0)}"
-                )
-
-                if stream:
-                    return StreamingResponse(
-                        forward_codex_chat_stream(
-                            url=CODEX_BASE_URL,
-                            api_key=CODEX_API_KEY,
-                            request_data=outbound_data,
-                            model=model,
-                            messages=data.get('messages', []),
-                            trace_id=trace_id,
-                            caller_key=caller_key,
-                            caller_desc=caller_desc,
-                            timeout=get_timeout_config(),
-                            max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                            deps=codex_deps,
-                        ),
-                        media_type='text/event-stream'
-                    )
-
-                try:
-                    full_content, usage, finish_reason = await collect_codex_chat_completion(
-                        url=CODEX_BASE_URL,
-                        api_key=CODEX_API_KEY,
-                        request_data=outbound_data,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        timeout=get_timeout_config(),
-                        max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                        deps=codex_deps,
-                    )
-                    return JSONResponse({
-                        "id": f"chatcmpl-{uuid.uuid4()}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": full_content
-                            },
-                            "finish_reason": finish_reason
-                        }],
-                        "usage": usage or {
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "total_tokens": 0
-                        }
-                    })
-                except Exception as e:
-                    log(f"{trace_prefix} GPT Responses collect error: {e}")
-                    save_request_log(
-                        model,
-                        data.get('messages', []),
-                        f"[ERROR] {e}",
-                        stream=False,
-                        request_payload=outbound_data,
-                        error_type="gpt_responses_upstream_error",
-                        trace_id=trace_id,
-                    )
-                    return JSONResponse(
-                        {"error": {"message": str(e), "type": "gpt_responses_upstream_error"}},
-                        status_code=502
-                    )
-
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {CODEX_API_KEY}',
-            }
-            outbound_data = dict(outbound_data)
-            if GPT_SERVICE_TIER:
-                outbound_data['service_tier'] = GPT_SERVICE_TIER
-            log(
-                f"{trace_prefix} Route to GPT upstream /v1/chat/completions: "
-                f"{model} service_tier={outbound_data.get('service_tier', '-')} "
-                f"since_enter={fmt_ms(route_t0)}"
-            )
-
-            if stream:
-                outbound_data['stream'] = True
-                return StreamingResponse(
-                    forward_stream(
-                        url=GPT_BASE_URL,
-                        request_data=outbound_data,
-                        headers=headers,
-                        timeout=get_timeout_config(),
-                        max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                        deps=build_openai_upstream_deps(),
-                        enable_early_stop=False,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        caller_key=caller_key,
-                        caller_desc=caller_desc,
-                    ),
-                    media_type='text/event-stream'
-                )
-
-            try:
-                full_content, model_name, usage, finish_reason, raw_sse = await collect_stream(
-                    url=GPT_BASE_URL,
-                    request_data=outbound_data,
-                    headers=headers,
-                    timeout=get_timeout_config(),
-                    max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                    deps=build_openai_upstream_deps(),
-                    enable_early_stop=False,
-                    trace_id=trace_id,
-                )
-
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    full_content,
-                    stream=False,
-                    raw_sse=raw_sse,
-                    request_payload=outbound_data,
-                    trace_id=trace_id,
-                )
-
-                return JSONResponse({
-                    "id": f"chatcmpl-{uuid.uuid4()}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model_name or model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": full_content
-                        },
-                        "finish_reason": finish_reason
-                    }],
-                    "usage": usage or {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0
-                    }
-                })
-            except Exception as e:
-                log(f"{trace_prefix} GPT collect error: {e}")
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    f"[ERROR] {e}",
-                    stream=False,
-                    request_payload=outbound_data,
-                    error_type="gpt_upstream_error",
-                    trace_id=trace_id,
-                )
-                return JSONResponse(
-                    {"error": {"message": str(e), "type": "gpt_upstream_error"}},
-                    status_code=502
-                )
-
-        if model_policy.is_codex_model(model):
-            removed_fields = model_policy.apply_codex_reasoning(data)
-            outbound_data = convert_chat_to_responses_request(data)
-            if removed_fields:
-                log(
-                    "Codex responses shim: "
-                    f"model={model}, "
-                    f"input_items={len(outbound_data.get('input', []))}, "
-                    f"instructions={'yes' if outbound_data.get('instructions') else 'no'}, "
-                    f"removed={','.join(sorted(removed_fields))}"
-                )
-            else:
-                log(
-                    "Codex responses shim: "
-                    f"model={model}, "
-                    f"input_items={len(outbound_data.get('input', []))}, "
-                    f"instructions={'yes' if outbound_data.get('instructions') else 'no'}"
-                )
-            if not CODEX_API_KEY:
-                if stream:
-                    release_active_stream_caller(caller_key, trace_id)
-                return JSONResponse(
-                    {"error": {"message": "CODEX_API_KEY is missing", "type": "config_error"}},
-                    status_code=500
-                )
-
-            outbound_data = dict(outbound_data)
-            outbound_data['stream'] = True
-            codex_deps = build_codex_upstream_deps()
-            log(f"{trace_prefix} Route to Codex upstream /v1/responses: {model} since_enter={fmt_ms(route_t0)}")
-
-            if stream:
-                return StreamingResponse(
-                    forward_codex_chat_stream(
-                        url=CODEX_BASE_URL,
-                        api_key=CODEX_API_KEY,
-                        request_data=outbound_data,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        caller_key=caller_key,
-                        caller_desc=caller_desc,
-                        timeout=get_timeout_config(),
-                        max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                        deps=codex_deps,
-                    ),
-                    media_type='text/event-stream'
-                )
-
-            full_content, usage, finish_reason = await collect_codex_chat_completion(
-                url=CODEX_BASE_URL,
-                api_key=CODEX_API_KEY,
-                request_data=outbound_data,
-                model=model,
-                messages=data.get('messages', []),
-                trace_id=trace_id,
-                timeout=get_timeout_config(),
-                max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                deps=codex_deps,
-            )
-            return JSONResponse({
-                "id": f"chatcmpl-{uuid.uuid4()}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": full_content
-                    },
-                    "finish_reason": finish_reason
-                }],
-                "usage": usage or {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
-                }
-            })
-
-        # 未出现在 /v1/models 的自填 model id：按模型名族群选择 OpenAI-compatible 上游透传。
-        passthrough_upstream = resolve_model_name_passthrough_upstream(model)
-        if passthrough_upstream:
-            route_name = passthrough_upstream.get('name') or 'openai-compatible-passthrough'
-            route_reason = passthrough_upstream.get('selection_reason') or 'unknown'
-            base_url = str(passthrough_upstream.get('base_url') or '').rstrip('/')
-            target_url = f"{base_url}/chat/completions"
-            outbound_data = copy.deepcopy(data)
-            if should_apply_deepseek_drawing_context_filter(route_name, base_url):
-                filter_stats = apply_drawing_context_filter(outbound_data)
-                if filter_stats.get('blocks'):
-                    log(
-                        f"{trace_prefix} model_name_passthrough_drawing_context_filter "
-                        f"name={route_name} messages={filter_stats['messages']} "
-                        f"blocks={filter_stats['blocks']} chars={filter_stats['chars']} "
-                        f"mode=closed_tags_and_bare_image_prompts"
-                    )
-            headers = {'Content-Type': 'application/json'}
-            route_key = str(passthrough_upstream.get('api_key') or '').strip()
-            if route_key:
-                headers['Authorization'] = f'Bearer {route_key}'
-            else:
-                inbound_auth = request.headers.get('authorization')
-                if inbound_auth:
-                    headers['Authorization'] = inbound_auth
-            log(
-                f"{trace_prefix} model_name_passthrough "
-                f"name={route_name} reason={route_reason} model={model} "
-                f"url={target_url} since_enter={fmt_ms(route_t0)}"
-            )
-            if stream:
-                outbound_data['stream'] = True
-                return StreamingResponse(
-                    forward_stream(
-                        url=target_url,
-                        request_data=outbound_data,
-                        headers=headers,
-                        timeout=get_timeout_config(),
-                        max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                        deps=build_openai_upstream_deps(),
-                        enable_early_stop=False,
-                        model=model,
-                        messages=data.get('messages', []),
-                        trace_id=trace_id,
-                        caller_key=caller_key,
-                        caller_desc=caller_desc,
-                    ),
-                    media_type='text/event-stream'
-                )
-            try:
-                full_content, model_name, usage, finish_reason, raw_sse = await collect_stream(
-                    url=target_url,
-                    request_data=outbound_data,
-                    headers=headers,
-                    timeout=get_timeout_config(),
-                    max_raw_sse_bytes=MAX_RAW_SSE_BYTES,
-                    deps=build_openai_upstream_deps(),
-                    enable_early_stop=False,
-                    trace_id=trace_id,
-                )
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    full_content,
-                    stream=False,
-                    raw_sse=raw_sse,
-                    request_payload=outbound_data,
-                    trace_id=trace_id,
-                )
-                return JSONResponse({
-                    "id": f"chatcmpl-{uuid.uuid4()}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model_name or model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": full_content,
-                        },
-                        "finish_reason": finish_reason,
-                    }],
-                    "usage": usage or {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                })
-            except Exception as e:
-                log(f"{trace_prefix} model-name passthrough collect error upstream={route_name}: {e}")
-                save_request_log(
-                    model,
-                    data.get('messages', []),
-                    f"[ERROR] {e}",
-                    stream=False,
-                    request_payload=outbound_data,
-                    error_type="model_name_passthrough_upstream_error",
-                    trace_id=trace_id,
-                )
-                return JSONResponse(
-                    {"error": {"message": str(e), "type": "model_name_passthrough_upstream_error"}},
-                    status_code=502,
-                )
-
-        # 未匹配任何显式路由且无透传上游：返回清晰错误。
-        if stream:
-            release_active_stream_caller(caller_key, trace_id)
-        err_msg = (
-            f"No upstream route for model {model!r}. Configure it in runtime-flags.json "
-            "openai_compatible_upstreams or use a built-in Claude/Gemini/GPT route."
-        )
-        log(f"{trace_prefix} no_route model={model} since_enter={fmt_ms(route_t0)}")
-        save_request_log(
-            model,
-            data.get('messages', []),
-            f"[NO_ROUTE] {err_msg}",
-            stream=bool(stream),
-            request_payload=data,
-            error_type="no_route",
-            trace_id=trace_id,
-        )
-        return JSONResponse(
-            {"error": {"message": err_msg, "type": "no_route"}},
-            status_code=404,
-        )
-
-    except httpx.TimeoutException:
-        log(f"{trace_prefix} Request timeout")
-        return JSONResponse(
-            {"error": {"message": "Upstream timeout", "type": "timeout"}},
-            status_code=504
-        )
-    except Exception as e:
-        log(f"{trace_prefix} Exception: {e}")
-        if isinstance(data, dict):
-            save_request_log(
-                data.get('model', ''),
-                data.get('messages', []),
-                f"[EXCEPTION] {e}",
-                stream=bool(data.get('stream', False)),
-                request_payload=data,
-                error_type="proxy_error",
-                trace_id=trace_id,
-            )
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(
-            {"error": {"message": str(e), "type": "proxy_error"}},
-            status_code=500
-        )
-
-
-@app.get('/v1/models')
-async def models(request: Request):
-    """返回本地模型 + 动态上游模型目录。"""
-    directory = await refresh_model_directory(
-        force=True,
-        request_authorization=request.headers.get('authorization', ''),
-    )
-    models_data = directory.get('models')
-    if not isinstance(models_data, list):
-        models_data = []
-    return JSONResponse({"object": "list", "data": models_data})
-
-
-@app.get('/health')
-async def health():
-    return JSONResponse({"status": "ok"})
-
-
-@app.get('/admin/claude-replay')
-async def admin_claude_replay_state():
-    return JSONResponse({
-        'ok': True,
-        'control': claude_replay.build_state(),
-        'entries': claude_replay.list_entries(),
-    })
-
-
-@app.post('/admin/claude-replay')
-async def admin_claude_replay_update(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            {'ok': False, 'error': 'Request body must be valid JSON'},
-            status_code=400,
-        )
-
-    if not isinstance(body, dict):
-        return JSONResponse(
-            {'ok': False, 'error': 'Request body must be a JSON object'},
-            status_code=400,
-        )
-
-    enabled = _coerce_bool(body.get('enabled'), False)
-    mode = str(body.get('mode', 'always') or 'always').strip().lower()
-    match_request = _coerce_bool(body.get('match_request'), True)
-    raw_sse_path = str(body.get('raw_sse_path', '') or '').strip()
-    input_json_path = str(body.get('input_json_path', '') or '').strip()
-
-    if mode not in claude_replay.allowed_modes:
-        return JSONResponse(
-            {
-                'ok': False,
-                'error': f"mode must be one of: {', '.join(sorted(claude_replay.allowed_modes))}",
-            },
-            status_code=400,
-        )
-
-    resolved_raw_sse_path = claude_replay.resolve_path(raw_sse_path)
-    resolved_input_json_path = claude_replay.resolve_path(input_json_path) if input_json_path else None
-
-    if enabled and not resolved_raw_sse_path:
-        return JSONResponse(
-            {'ok': False, 'error': 'Enabled replay requires a readable raw_sse_path'},
-            status_code=400,
-        )
-
-    if enabled and match_request and not resolved_input_json_path:
-        resolved_input_json_path = claude_replay.derive_input_json_path(raw_sse_path)
-        if resolved_input_json_path and not input_json_path:
-            input_json_path = os.path.basename(resolved_input_json_path)
-
-    if enabled and match_request and not resolved_input_json_path:
-        return JSONResponse(
-            {'ok': False, 'error': 'match_request=true requires a readable input_json_path'},
-            status_code=400,
-        )
-
-    control = {
-        'enabled': enabled,
-        'mode': mode,
-        'match_request': match_request,
-        'raw_sse_path': raw_sse_path,
-    }
-    if input_json_path:
-        control['input_json_path'] = input_json_path
-
-    try:
-        claude_replay.write_control(control)
-    except Exception as e:
-        log(f"Claude replay control write failed: {e}")
-        return JSONResponse(
-            {'ok': False, 'error': f'Failed to write control file: {e}'},
-            status_code=500,
-        )
-
-    return JSONResponse({
-        'ok': True,
-        'control': claude_replay.build_state(),
-        'entries': claude_replay.list_entries(),
-    })
-
-
-@app.get('/admin/claude-replay/log-output')
-async def admin_claude_replay_log_output(raw_sse_path: str):
-    output_txt_path = claude_replay.derive_output_txt_path(raw_sse_path)
-    if not output_txt_path:
-        return JSONResponse(
-            {'ok': False, 'error': 'output txt not found for selected raw_sse_path'},
-            status_code=404,
-        )
-
-    try:
-        with open(output_txt_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-    except Exception as e:
-        return JSONResponse(
-            {'ok': False, 'error': f'failed to read output txt: {e}'},
-            status_code=500,
-        )
-
-    try:
-        size_bytes = os.stat(output_txt_path).st_size
-    except Exception:
-        size_bytes = len(text.encode('utf-8', errors='ignore'))
-
-    return JSONResponse({
-        'ok': True,
-        'raw_sse_path': raw_sse_path,
-        'output_txt_path': os.path.basename(output_txt_path),
-        'size_bytes': size_bytes,
-        'text': text,
-    })
+messages_route_dependencies = register_messages_routes(app, ctx=globals())
+chat_route_dependencies = register_chat_routes(app, ctx=globals())
+system_route_dependencies = register_system_routes(app, ctx=globals())
+admin_route_dependencies = register_admin_routes(app, ctx=globals())
 
 
 if __name__ == '__main__':

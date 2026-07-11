@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -16,6 +17,7 @@ class ProxyLogger:
         self.verbose_trace = os.environ.get("STREAM_PROXY_VERBOSE_TRACE", "false").lower() == "true"
         os.makedirs(self.log_dir, exist_ok=True)
         self.counter_file = os.path.join(self.log_dir, "counter.txt")
+        self._write_lock = threading.RLock()
 
     def log(self, msg: str) -> None:
         if self.debug and self._should_emit(msg):
@@ -88,6 +90,34 @@ class ProxyLogger:
         error_type: str | None = None,
         trace_id: str | None = None,
     ) -> None:
+        with self._write_lock:
+            self._save_request_log_locked(
+                model=model,
+                messages=messages,
+                response=response,
+                stream=stream,
+                raw_sse=raw_sse,
+                request_payload=request_payload,
+                inbound_request_payload=inbound_request_payload,
+                debug_meta=debug_meta,
+                error_type=error_type,
+                trace_id=trace_id,
+            )
+
+    def _save_request_log_locked(
+        self,
+        *,
+        model: str,
+        messages: list,
+        response: str,
+        stream: bool,
+        raw_sse: str = "",
+        request_payload: dict | None = None,
+        inbound_request_payload: dict | None = None,
+        debug_meta: dict | None = None,
+        error_type: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
         log_id = self._get_next_log_id()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -109,31 +139,40 @@ class ProxyLogger:
             input_payload["error_type"] = error_type
 
         input_file = os.path.join(self.log_dir, f"{log_id:02d}_input.json")
-        with open(input_file, "w", encoding="utf-8") as f:
-            json.dump(input_payload, f, ensure_ascii=False, indent=2)
+        self._write_text_atomic(
+            input_file,
+            json.dumps(input_payload, ensure_ascii=False, indent=2),
+        )
 
         output_file = os.path.join(self.log_dir, f"{log_id:02d}_output.txt")
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(f"Time: {timestamp}\n")
-            f.write(f"Model: {model}\n")
-            f.write(f"Stream: {stream}\n")
-            if trace_id:
-                f.write(f"TraceId: {trace_id}\n")
-            if error_type:
-                f.write(f"ErrorType: {error_type}\n")
-            f.write(f"Length: {len(response)}\n")
-            f.write("=" * 50 + "\n")
-            f.write(response)
+        output_lines = [
+            f"Time: {timestamp}",
+            f"Model: {model}",
+            f"Stream: {stream}",
+        ]
+        if trace_id:
+            output_lines.append(f"TraceId: {trace_id}")
+        if error_type:
+            output_lines.append(f"ErrorType: {error_type}")
+        output_lines.extend([
+            f"Length: {len(response)}",
+            "=" * 50,
+            response,
+        ])
+        self._write_text_atomic(output_file, "\n".join(output_lines))
 
+        raw_file = os.path.join(self.log_dir, f"{log_id:02d}_raw_sse.txt")
         if raw_sse:
-            raw_file = os.path.join(self.log_dir, f"{log_id:02d}_raw_sse.txt")
-            with open(raw_file, "w", encoding="utf-8") as f:
-                f.write(f"Time: {timestamp}\n")
-                f.write(f"Model: {model}\n")
-                if trace_id:
-                    f.write(f"TraceId: {trace_id}\n")
-                f.write("=" * 50 + "\n")
-                f.write(raw_sse)
+            raw_lines = [f"Time: {timestamp}", f"Model: {model}"]
+            if trace_id:
+                raw_lines.append(f"TraceId: {trace_id}")
+            raw_lines.extend(["=" * 50, raw_sse])
+            self._write_text_atomic(raw_file, "\n".join(raw_lines))
+        else:
+            try:
+                os.unlink(raw_file)
+            except FileNotFoundError:
+                pass
 
         input_size_obj = request_payload if request_payload is not None else {"messages": messages}
         trace_part = f" trace={trace_id}" if trace_id else ""
@@ -150,9 +189,21 @@ class ProxyLogger:
         except Exception:
             counter = 0
         next_id = (counter % 10) + 1
-        with open(self.counter_file, "w", encoding="utf-8") as f:
-            f.write(str(next_id))
+        self._write_text_atomic(self.counter_file, str(next_id))
         return next_id
+
+    @staticmethod
+    def _write_text_atomic(path: str, text: str) -> None:
+        temp_path = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(temp_path, path)
+        finally:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
     @staticmethod
     def _clip(value: str, limit: int = 120) -> str:
