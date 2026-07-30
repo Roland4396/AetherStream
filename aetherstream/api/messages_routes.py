@@ -5,10 +5,12 @@ import uuid
 from typing import Any
 
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from aetherstream.api.dependencies import RouteDependencies, build_route_dependencies
 from aetherstream.features.request_injections import append_assistant_prefill_continuation
+from aetherstream.streaming.json_keepalive import keepalive_json_response
+from aetherstream.streaming.responses import DisconnectSafeStreamingResponse as StreamingResponse
 
 
 def _is_pioneer_auto_model(model: Any) -> bool:
@@ -94,12 +96,12 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
         if stream:
             # 流式：透传
             return StreamingResponse(
-                deps.forward_anthropic_stream(
+                deps.forward_anthropic_messages_stream(
                     url=target_url,
                     request_data=data,
                     headers=forward_headers,
                     timeout=deps.get_timeout_config(),
-                    deps=deps.build_anthropic_upstream_deps(),
+                    deps=deps.build_anthropic_messages_deps(),
                     enable_early_stop=False,
                     trace_id=trace_id,
                 ),
@@ -108,14 +110,14 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
 
         # 非流式：内部仍走上游流式，再聚合回标准 Anthropic JSON
         try:
-            resp_data, raw_sse = await deps.collect_anthropic_message_response(
+            resp_data, raw_sse = await deps.collect_anthropic_messages_response(
                 url=target_url,
                 request_data=data,
                 headers=forward_headers,
                 model=model,
                 timeout=deps.get_timeout_config(),
                 max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                deps=deps.build_anthropic_upstream_deps(),
+                deps=deps.build_anthropic_messages_deps(),
                 trace_id=trace_id,
             )
             deps.save_request_log(
@@ -166,12 +168,12 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
 
 MESSAGES_DEPENDENCY_NAMES = (
     'MAX_RAW_SSE_BYTES',
-    'build_anthropic_upstream_deps',
+    'build_anthropic_messages_deps',
     'build_claude_messages_url',
     'build_claude_upstream_headers',
-    'collect_anthropic_message_response',
+    'collect_anthropic_messages_response',
     'extract_claude_session_id',
-    'forward_anthropic_stream',
+    'forward_anthropic_messages_stream',
     'get_claude_upstream_for_provider',
     'get_timeout_config',
     'log',
@@ -185,9 +187,23 @@ MESSAGES_DEPENDENCY_NAMES = (
 
 def register_routes(app, ctx: dict[str, Any]) -> RouteDependencies:
     deps = build_route_dependencies(ctx, MESSAGES_DEPENDENCY_NAMES)
+    nonstream_keepalive_interval = float(ctx.get('NONSTREAM_KEEPALIVE_INTERVAL', 10.0))
 
     async def anthropic_messages_endpoint(request: Request):
-        return await anthropic_messages(request, deps)
+        try:
+            payload = await request.json()
+        except Exception:
+            return await anthropic_messages(request, deps)
+
+        if not isinstance(payload, dict) or payload.get('stream', False):
+            return await anthropic_messages(request, deps)
+
+        return keepalive_json_response(
+            lambda: anthropic_messages(request, deps),
+            interval=nonstream_keepalive_interval,
+            trace_id=getattr(request.state, 'trace_id', ''),
+            log=deps.log,
+        )
 
     app.post('/v1/messages')(anthropic_messages_endpoint)
     return deps

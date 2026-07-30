@@ -8,6 +8,7 @@ from aetherstream.features.request_injections import (
     ASSISTANT_PREFILL_CONTINUATION_TEXT,
     append_assistant_prefill_continuation,
     apply_direct_opus_note,
+    apply_forced_opus_note,
     apply_pioneer_opus_note,
 )
 
@@ -65,6 +66,48 @@ class RequestInjectionTests(unittest.TestCase):
         content = request["messages"][0]["content"]
         self.assertEqual(content.count(PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER), 3)
         self.assertEqual(content.count(PRO_OPUS_LAST_USER_APPEND_MARKER), 1)
+
+    def test_pioneer_opus_illustration_falls_back_without_latest_human_tag(self):
+        request = {
+            "messages": [
+                {"role": "user", "content": "current SillyTavern prompt"},
+                {"role": "assistant", "content": "prefill"},
+            ]
+        }
+
+        apply_pioneer_opus_note(
+            request,
+            selected_model="claude-opus-4-6",
+            trace_prefix="[TRACE test]",
+            route_label="free_openai",
+            runtime_lookup=lambda *keys: True,
+            is_opus_model=lambda _model: True,
+            log=lambda _message: None,
+        )
+
+        content = request["messages"][0]["content"]
+        self.assertIn(PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER, content)
+        self.assertIn(PRO_OPUS_LAST_USER_APPEND_MARKER, content)
+
+    def test_forced_opus_injection_applies_to_non_opus_channel(self):
+        request = {
+            "messages": [{
+                "role": "user",
+                "content": "<latest_human_message>hello</latest_human_message>",
+            }]
+        }
+
+        apply_forced_opus_note(
+            request,
+            selected_model="grok-4.5",
+            trace_prefix="[TRACE test]",
+            route_label="configured",
+            log=lambda _message: None,
+        )
+
+        content = request["messages"][0]["content"]
+        self.assertIn(PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER, content)
+        self.assertIn(PRO_OPUS_LAST_USER_APPEND_MARKER, content)
 
 
 if __name__ == "__main__":

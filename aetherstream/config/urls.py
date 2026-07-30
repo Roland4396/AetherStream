@@ -12,7 +12,7 @@ def normalize_openai_chat_base_url(raw_url: str) -> str:
     return base
 
 
-def normalize_codex_responses_base_url(raw_url: str) -> str:
+def normalize_openai_responses_base_url(raw_url: str) -> str:
     base = (raw_url or '').strip().rstrip('/')
     if not base:
         return 'https://api.openai.com/v1/responses'
@@ -21,3 +21,7 @@ def normalize_codex_responses_base_url(raw_url: str) -> str:
         return f'{base}/responses'
 
     return base
+
+
+# Legacy import compatibility. New code should use the protocol name above.
+normalize_codex_responses_base_url = normalize_openai_responses_base_url

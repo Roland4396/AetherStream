@@ -86,10 +86,18 @@ def _apply_opus_note(
             PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
             PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
         )
+        placement = 'latest_human_message'
+        if not illustrated:
+            illustrated = append_to_last_user_message(
+                messages,
+                PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
+                PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
+            )
+            placement = 'last_user_fallback'
         action = 'inserted' if illustrated else 'skipped'
         log(
             f"{trace_prefix} {route_label}_{feature_prefix}latest_human_illustration "
-            f"{action} model={selected_model}{context_suffix}"
+            f"{action} placement={placement} model={selected_model}{context_suffix}"
         )
     else:
         log(

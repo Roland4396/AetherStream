@@ -7,16 +7,16 @@ import httpx
 
 from .protocol import _extract_anthropic_sse_text
 from .transport import _close_upstream_stream, _prime_code_cli_connection
-from .types import AnthropicUpstreamDeps
+from .types import AnthropicMessagesDeps
 
 
-async def forward_anthropic_stream(
+async def forward_anthropic_messages_stream(
     *,
     url: str,
     request_data: dict,
     headers: dict,
     timeout: httpx.Timeout,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
     enable_early_stop: bool = True,
     trace_id: str = "",
 ) -> AsyncGenerator[bytes, None]:

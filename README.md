@@ -15,7 +15,7 @@ AetherStream 是一个面向长会话、角色扮演、Agent、SillyTavern 等�
 - **多供应商路由**
   - OpenAI-compatible upstream
   - Gemini native HTTP
-  - Codex / Responses API 风格上游
+  - OpenAI Responses API 风格上游
   - Anthropic Messages 风格上游
   - Claude-like provider shim
 
@@ -114,11 +114,11 @@ LOG_DIR=/app/logs
 RUNTIME_FLAGS_PATH=/app/runtime-flags.json
 ```
 
-OpenAI / Codex compatible：
+OpenAI Responses API：
 
 ```env
-CODEX_API_KEY=
-CODEX_BASE_URL=https://api.openai.com/v1
+RESPONSES_API_KEY=
+RESPONSES_BASE_URL=https://api.openai.com/v1
 GPT_USE_RESPONSES=true
 ```
 

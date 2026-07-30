@@ -13,7 +13,7 @@ from .protocol import (
     _normalize_usage,
     _truncate_for_stop_tag,
 )
-from .types import AnthropicUpstreamDeps
+from .types import AnthropicMessagesDeps
 
 
 async def replay_anthropic_chat_stream(
@@ -25,7 +25,7 @@ async def replay_anthropic_chat_stream(
     trace_id: str,
     caller_key: str,
     caller_desc: str,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
 ) -> AsyncGenerator[bytes, None]:
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
@@ -266,7 +266,7 @@ async def collect_anthropic_chat_completion_from_raw_sse(
     model: str,
     messages: list,
     trace_id: str,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
 ) -> tuple[str, str, dict[str, Any], str, str]:
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
     raw_sse_lines = _extract_saved_raw_sse_lines(raw_sse_text)

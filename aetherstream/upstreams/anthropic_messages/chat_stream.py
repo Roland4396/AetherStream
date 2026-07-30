@@ -26,10 +26,10 @@ from .protocol import (
     _truncate_for_stop_tag,
 )
 from .transport import _is_async_generator_close_race, _prime_code_cli_connection
-from .types import AnthropicUpstreamDeps
+from .types import AnthropicMessagesDeps
 
 
-async def forward_anthropic_chat_stream(
+async def forward_anthropic_messages_as_chat_stream(
     *,
     url: str,
     request_data: dict[str, Any],
@@ -41,7 +41,7 @@ async def forward_anthropic_chat_stream(
     caller_desc: str,
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
     cache_keepalive: dict[str, Any] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     request_t0 = time.perf_counter()
@@ -83,6 +83,12 @@ async def forward_anthropic_chat_stream(
         and _has_cache_control(request_data)
     )
     upstream_closed_by_proxy = False
+    header_keepalive_enabled = bool(deps.header_keepalive_enabled)
+    header_keepalive_interval_sec = max(0.1, float(deps.header_keepalive_interval_sec or 3.0))
+    stream_idle_timeout_enabled = bool(deps.stream_idle_timeout_enabled)
+    stream_idle_timeout_sec = max(0.1, float(deps.stream_idle_timeout_sec or 4.0))
+    upstream_data_started = False
+    last_upstream_data_time: float | None = None
 
     def emit_done() -> bytes:
         return b"data: [DONE]\n\n"
@@ -191,7 +197,33 @@ async def forward_anthropic_chat_stream(
             )
             deps.log(f"{trace_prefix}claude_upstream_request_start elapsed={deps.fmt_ms(request_t0)}")
             upstream_t0 = time.perf_counter()
-            async with client.stream("POST", url, json=request_data, headers=headers) as response:
+            upstream_request = client.build_request("POST", url, json=request_data, headers=headers)
+            upstream_open_task = asyncio.create_task(client.send(upstream_request, stream=True))
+            response: httpx.Response | None = None
+            try:
+                if header_keepalive_enabled:
+                    while response is None:
+                        try:
+                            response = await asyncio.wait_for(
+                                asyncio.shield(upstream_open_task),
+                                timeout=header_keepalive_interval_sec,
+                            )
+                        except asyncio.TimeoutError:
+                            keepalive_count += 1
+                            last_downstream_emit = time.perf_counter()
+                            deps.log(
+                                f"{trace_prefix}claude_downstream_header_keepalive "
+                                f"count={keepalive_count} interval={header_keepalive_interval_sec:.3f}s "
+                                f"header_wait={deps.fmt_ms(upstream_t0)}"
+                            )
+                            yield _build_openai_keepalive_chunk(
+                                stream_id=stream_id,
+                                created=created,
+                                model=model,
+                            )
+                else:
+                    response = await upstream_open_task
+
                 deps.log(
                     f"{trace_prefix}claude_upstream_headers status={response.status_code} "
                     f"elapsed={deps.fmt_ms(upstream_t0)}"
@@ -244,6 +276,7 @@ async def forward_anthropic_chat_stream(
                     )
 
                 async def read_upstream_lines() -> None:
+                    nonlocal upstream_data_started, last_upstream_data_time
                     reader_t0 = time.perf_counter()
                     reader_last_progress = reader_t0
                     reader_lines = 0
@@ -283,6 +316,8 @@ async def forward_anthropic_chat_stream(
                                 if event_name == "ping":
                                     reader_log_progress("reader_ping")
                             elif upstream_line.startswith("data: "):
+                                upstream_data_started = True
+                                last_upstream_data_time = time.perf_counter()
                                 reader_data_lines += 1
                                 payload = upstream_line[6:].strip()
                                 if payload:
@@ -312,12 +347,67 @@ async def forward_anthropic_chat_stream(
                 upstream_reader = asyncio.create_task(read_upstream_lines())
                 try:
                     while True:
+                        queue_wait_timeout = keepalive_interval
+                        if (
+                            stream_idle_timeout_enabled
+                            and upstream_data_started
+                            and last_upstream_data_time is not None
+                        ):
+                            idle_remaining = stream_idle_timeout_sec - (
+                                time.perf_counter() - last_upstream_data_time
+                            )
+                            queue_wait_timeout = max(0.001, min(keepalive_interval, idle_remaining))
                         try:
                             queued_line = await asyncio.wait_for(
                                 line_queue.get(),
-                                timeout=keepalive_interval,
+                                timeout=queue_wait_timeout,
                             )
                         except asyncio.TimeoutError:
+                            now = time.perf_counter()
+                            upstream_data_idle = (
+                                stream_idle_timeout_enabled
+                                and upstream_data_started
+                                and last_upstream_data_time is not None
+                                and now - last_upstream_data_time >= stream_idle_timeout_sec
+                            )
+                            if upstream_data_idle:
+                                finish_status = "anthropic_upstream_data_idle_timeout"
+                                idle_for = now - last_upstream_data_time
+                                deps.log(
+                                    f"{trace_prefix}claude_upstream_data_idle_timeout "
+                                    f"idle={idle_for:.3f}s limit={stream_idle_timeout_sec:.3f}s "
+                                    f"lines={line_count} data_lines={data_line_count} "
+                                    f"out_chars={len(full_response)} last_event={last_event_type}"
+                                )
+                                deps.save_request_log(
+                                    model,
+                                    messages,
+                                    full_response or "[empty response]",
+                                    stream=True,
+                                    raw_sse="\n".join(
+                                        raw_sse_lines
+                                        + [f"[UPSTREAM_DATA_IDLE_TIMEOUT: {idle_for:.3f}s]"]
+                                    ),
+                                    request_payload=request_data,
+                                    error_type="claude_upstream_data_idle_timeout",
+                                    trace_id=trace_id,
+                                )
+                                await close_upstream_for_early_stop(
+                                    response=response,
+                                    client=client,
+                                    reader_task=upstream_reader,
+                                    reason="upstream_data_idle_timeout",
+                                )
+                                yield deps.build_openai_sse_error(
+                                    504,
+                                    (
+                                        "Anthropic upstream emitted no SSE data for "
+                                        f"{stream_idle_timeout_sec:g} seconds"
+                                    ),
+                                    "upstream_stream_idle_timeout",
+                                )
+                                yield emit_done()
+                                return
                             keepalive = emit_keepalive_if_idle()
                             if keepalive is not None:
                                 yield keepalive
@@ -590,6 +680,20 @@ async def forward_anthropic_chat_stream(
                         "upstream_stream_incomplete",
                     )
                     yield emit_done()
+            finally:
+                if not upstream_open_task.done():
+                    upstream_open_task.cancel()
+                    try:
+                        await upstream_open_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                if response is not None:
+                    try:
+                        await response.aclose()
+                    except Exception:
+                        pass
     except asyncio.CancelledError:
         finish_status = "downstream_cancelled"
         deps.save_request_log(
@@ -651,7 +755,11 @@ async def forward_anthropic_chat_stream(
                     await cache_keepalive_task
                 except asyncio.CancelledError:
                     pass
-        if cache_keepalive_enabled and isinstance(cache_keepalive, dict) and finish_status not in {"early_stop_tag", "downstream_cancelled"}:
+        if cache_keepalive_enabled and isinstance(cache_keepalive, dict) and finish_status not in {
+            "early_stop_tag",
+            "downstream_cancelled",
+            "anthropic_upstream_data_idle_timeout",
+        }:
             post_state = _ClaudeCachePostKeepaliveState()
             post_task = asyncio.create_task(
                 _run_claude_cache_post_keepalive_after_delay(

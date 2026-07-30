@@ -9,7 +9,7 @@ import httpx
 
 
 @dataclass
-class CodexUpstreamDeps:
+class ResponsesUpstreamDeps:
     log: Callable[[str], None]
     save_request_log: Callable[..., None]
     build_openai_sse_error: Callable[[int, str, str], bytes]
@@ -108,7 +108,7 @@ async def _close_upstream_stream(
     *,
     response: httpx.Response | None,
     client: httpx.AsyncClient | None,
-    deps: CodexUpstreamDeps,
+    deps: ResponsesUpstreamDeps,
     trace_prefix: str,
     label: str,
     reason: str,
@@ -147,7 +147,7 @@ async def _close_upstream_stream(
     )
 
 
-async def forward_codex_chat_stream(
+async def forward_responses_as_chat_stream(
     *,
     url: str,
     api_key: str,
@@ -159,7 +159,7 @@ async def forward_codex_chat_stream(
     caller_desc: str,
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
-    deps: CodexUpstreamDeps,
+    deps: ResponsesUpstreamDeps,
 ) -> AsyncGenerator[bytes, None]:
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
@@ -197,7 +197,7 @@ async def forward_codex_chat_stream(
             )
             saved_log = True
         except Exception as save_err:
-            deps.log(f"{trace_prefix}codex_stream_log_error err={save_err}")
+            deps.log(f"{trace_prefix}responses_stream_log_error err={save_err}")
 
     def emit_done() -> bytes:
         return b"data: [DONE]\n\n"
@@ -211,7 +211,7 @@ async def forward_codex_chat_stream(
         idle_ms = (now - last_downstream_emit) * 1000
         last_downstream_emit = now
         deps.log(
-            f"{trace_prefix}codex_downstream_keepalive "
+            f"{trace_prefix}responses_downstream_keepalive "
             f"count={keepalive_count} reason={reason} idle_ms={idle_ms:.1f}"
         )
         chunk = _build_openai_chunk(
@@ -225,7 +225,7 @@ async def forward_codex_chat_stream(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
-        "User-Agent": f"StreamProxy/1.0 Codex/{model}",
+        "User-Agent": f"StreamProxy/1.0 OpenAI-Responses/{model}",
     }
 
     async def open_upstream() -> tuple[httpx.AsyncClient, Any, httpx.Response]:
@@ -235,7 +235,7 @@ async def forward_codex_chat_stream(
             cm = client.stream("POST", url, json=request_data, headers=headers)
             response = await cm.__aenter__()
             deps.log(
-                f"{trace_prefix}codex_upstream_headers status={response.status_code} "
+                f"{trace_prefix}responses_upstream_headers status={response.status_code} "
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
             return client, cm, response
@@ -272,13 +272,13 @@ async def forward_codex_chat_stream(
                 persist_log(
                     f"[UPSTREAM_HTTP_ERROR] {error_text}",
                     raw_sse=f"[HTTP {response.status_code}]\n{error_text}",
-                    error_type="codex_upstream_http_error",
+                    error_type="responses_upstream_http_error",
                 )
                 finish_status = f"upstream_http_{response.status_code}"
                 yield deps.build_openai_sse_error(
                     response.status_code,
                     error_text,
-                    "codex_upstream_http_error",
+                    "responses_upstream_http_error",
                 )
                 yield emit_done()
                 return
@@ -308,7 +308,7 @@ async def forward_codex_chat_stream(
                 if first_data_time is None:
                     first_data_time = time.perf_counter()
                     deps.log(
-                        f"{trace_prefix}codex_upstream_first_data "
+                        f"{trace_prefix}responses_upstream_first_data "
                         f"elapsed={deps.fmt_ms(request_t0, first_data_time)}"
                     )
 
@@ -330,13 +330,13 @@ async def forward_codex_chat_stream(
                     persist_log(
                         f"[UPSTREAM_ERROR_EVENT] {err_msg}",
                         raw_sse="\n".join(raw_sse_lines),
-                        error_type="codex_upstream_error_event",
+                        error_type="responses_upstream_error_event",
                     )
                     finish_status = "upstream_error_event"
                     yield deps.build_openai_sse_error(
                         502,
                         err_msg[:4000],
-                        err.get("type", "codex_upstream_error"),
+                        err.get("type", "responses_upstream_error"),
                     )
                     yield emit_done()
                     return
@@ -387,7 +387,7 @@ async def forward_codex_chat_stream(
                             deps=deps,
                             trace_prefix=trace_prefix,
                             label="early_stop",
-                            reason="codex_stream_stop_tag",
+                            reason="responses_stream_stop_tag",
                             started_at=request_t0,
                             line_count=line_count,
                             data_line_count=data_line_count,
@@ -440,21 +440,21 @@ async def forward_codex_chat_stream(
                         full_response or "[empty response]",
                         raw_sse="\n".join(raw_sse_lines),
                     )
-                    finish_status = "codex_response_completed"
+                    finish_status = "responses_response_completed"
                     last_downstream_emit = time.perf_counter()
                     yield f"data: {json.dumps(stop_chunk, ensure_ascii=True)}\n\n".encode()
                     yield emit_done()
                     return
 
-            finish_status = "codex_incomplete_stream_end"
+            finish_status = "responses_incomplete_stream_end"
             persist_log(
                 full_response or "[empty response]",
                 raw_sse="\n".join(raw_sse_lines + ["[UPSTREAM_INCOMPLETE]"]),
-                error_type="codex_upstream_incomplete",
+                error_type="responses_upstream_incomplete",
             )
             yield deps.build_openai_sse_error(
                 502,
-                "Codex stream closed without response.completed",
+                "OpenAI Responses stream closed without response.completed",
                 "upstream_stream_incomplete",
             )
             yield emit_done()
@@ -502,9 +502,9 @@ async def forward_codex_chat_stream(
         persist_log(
             full_response + f"\n[ERROR] {e}" if full_response else f"[ERROR] {e}",
             raw_sse="\n".join(raw_sse_lines + [f"[EXCEPTION] {e}"]),
-            error_type="codex_upstream_proxy_error",
+            error_type="responses_upstream_proxy_error",
         )
-        yield deps.build_openai_sse_error(502, str(e), "codex_upstream_proxy_error")
+        yield deps.build_openai_sse_error(502, str(e), "responses_upstream_proxy_error")
         yield emit_done()
     finally:
         if not saved_log:
@@ -513,12 +513,12 @@ async def forward_codex_chat_stream(
             persist_log(
                 full_response or "[stream finalized before content]",
                 raw_sse="\n".join(raw_sse_lines + ["[FINALIZED_WITHOUT_TERMINAL_EVENT]"]),
-                error_type="codex_stream_finalized",
+                error_type="responses_stream_finalized",
             )
         if caller_key:
             deps.release_caller(caller_key, trace_id)
         deps.log(
-            f"{trace_prefix}codex_upstream_done reason={finish_status} "
+            f"{trace_prefix}responses_upstream_done reason={finish_status} "
             f"elapsed={deps.fmt_ms(request_t0)} "
             f"first_data={deps.fmt_ms(request_t0, first_data_time) if first_data_time else '-'} "
             f"lines={line_count} data_lines={data_line_count} "
@@ -527,7 +527,7 @@ async def forward_codex_chat_stream(
         )
 
 
-async def collect_codex_chat_completion(
+async def collect_responses_as_chat_completion(
     *,
     url: str,
     api_key: str,
@@ -537,7 +537,7 @@ async def collect_codex_chat_completion(
     trace_id: str,
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
-    deps: CodexUpstreamDeps,
+    deps: ResponsesUpstreamDeps,
     save_log: bool = True,
 ) -> tuple[str, dict[str, Any], str]:
     request_t0 = time.perf_counter()
@@ -553,14 +553,14 @@ async def collect_codex_chat_completion(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
-        "User-Agent": f"StreamProxy/1.0 Codex/{model}",
+        "User-Agent": f"StreamProxy/1.0 OpenAI-Responses/{model}",
     }
 
     async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
         upstream_t0 = time.perf_counter()
         async with client.stream("POST", url, json=request_data, headers=headers) as response:
             deps.log(
-                f"{trace_prefix}codex_collect_headers status={response.status_code} "
+                f"{trace_prefix}responses_collect_headers status={response.status_code} "
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
             if response.status_code != 200:
@@ -572,10 +572,10 @@ async def collect_codex_chat_completion(
                     stream=False,
                     raw_sse=f"[HTTP {response.status_code}]\n{error_text}",
                     request_payload=request_data,
-                    error_type="codex_upstream_http_error",
+                    error_type="responses_upstream_http_error",
                     trace_id=trace_id,
                 )
-                raise RuntimeError(f"Codex upstream HTTP {response.status_code}: {error_text}")
+                raise RuntimeError(f"OpenAI Responses upstream HTTP {response.status_code}: {error_text}")
 
             async for line in response.aiter_lines():
                 raw_sse_size, raw_sse_truncated = _append_raw_line(
@@ -608,7 +608,7 @@ async def collect_codex_chat_completion(
                         stream=False,
                         raw_sse="\n".join(raw_sse_lines),
                         request_payload=request_data,
-                        error_type="codex_upstream_error_event",
+                        error_type="responses_upstream_error_event",
                         trace_id=trace_id,
                     )
                     raise RuntimeError(err_msg)
@@ -630,7 +630,7 @@ async def collect_codex_chat_completion(
                                 deps=deps,
                                 trace_prefix=trace_prefix,
                                 label="early_stop",
-                                reason="codex_collect_stop_tag",
+                                reason="responses_collect_stop_tag",
                                 started_at=request_t0,
                                 line_count=0,
                                 data_line_count=0,
@@ -659,13 +659,13 @@ async def collect_codex_chat_completion(
             trace_id=trace_id,
         )
     deps.log(
-        f"{trace_prefix}codex_collect_done elapsed={deps.fmt_ms(request_t0)} "
+        f"{trace_prefix}responses_collect_done elapsed={deps.fmt_ms(request_t0)} "
         f"out_chars={len(full_response)} usage_total={usage.get('total_tokens', 0)}"
     )
     return full_response, usage, finish_reason
 
 
-async def collect_codex_response_nonstream(
+async def collect_responses_nonstream(
     *,
     url: str,
     api_key: str,
@@ -674,10 +674,10 @@ async def collect_codex_response_nonstream(
     messages: list,
     trace_id: str,
     timeout: httpx.Timeout,
-    deps: CodexUpstreamDeps,
+    deps: ResponsesUpstreamDeps,
     save_log: bool = True,
 ) -> tuple[str, dict[str, Any], str, str]:
-    """Call Codex Responses upstream as true non-stream JSON and extract assistant text."""
+    """Call OpenAI Responses upstream as true non-stream JSON and extract assistant text."""
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
     payload = dict(request_data)
@@ -686,18 +686,18 @@ async def collect_codex_response_nonstream(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": f"StreamProxy/1.0 Codex/{model}",
+        "User-Agent": f"StreamProxy/1.0 OpenAI-Responses/{model}",
     }
     async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
         upstream_t0 = time.perf_counter()
         deps.log(
-            f"{trace_prefix}codex_nonstream_request_start "
+            f"{trace_prefix}responses_nonstream_request_start "
             f"elapsed={deps.fmt_ms(request_t0)} model={model}"
         )
         response = await client.post(url, json=payload, headers=headers)
         raw_text = response.text
         deps.log(
-            f"{trace_prefix}codex_nonstream_response status={response.status_code} "
+            f"{trace_prefix}responses_nonstream_response status={response.status_code} "
             f"elapsed={deps.fmt_ms(upstream_t0)} bytes={len(raw_text.encode(errors='replace'))}"
         )
         if response.status_code != 200:
@@ -710,10 +710,10 @@ async def collect_codex_response_nonstream(
                     stream=False,
                     raw_sse=f"[HTTP {response.status_code}]\n{error_text}",
                     request_payload=payload,
-                    error_type="codex_nonstream_http_error",
+                    error_type="responses_nonstream_http_error",
                     trace_id=trace_id,
                 )
-            raise RuntimeError(f"Codex upstream HTTP {response.status_code}: {error_text}")
+            raise RuntimeError(f"OpenAI Responses upstream HTTP {response.status_code}: {error_text}")
         try:
             data = response.json()
         except Exception as exc:
@@ -725,10 +725,10 @@ async def collect_codex_response_nonstream(
                     stream=False,
                     raw_sse=raw_text[:4000],
                     request_payload=payload,
-                    error_type="codex_nonstream_non_json",
+                    error_type="responses_nonstream_non_json",
                     trace_id=trace_id,
                 )
-            raise RuntimeError(f"Codex upstream returned non-JSON response: {raw_text[:4000]}") from exc
+            raise RuntimeError(f"OpenAI Responses upstream returned non-JSON response: {raw_text[:4000]}") from exc
 
     if isinstance(data.get("error"), dict):
         err = data["error"]
@@ -741,7 +741,7 @@ async def collect_codex_response_nonstream(
                 stream=False,
                 raw_sse=raw_text[:4000],
                 request_payload=payload,
-                error_type="codex_nonstream_error",
+                error_type="responses_nonstream_error",
                 trace_id=trace_id,
             )
         raise RuntimeError(err_msg)
@@ -769,13 +769,13 @@ async def collect_codex_response_nonstream(
             trace_id=trace_id,
         )
     deps.log(
-        f"{trace_prefix}codex_nonstream_collect_done elapsed={deps.fmt_ms(request_t0)} "
+        f"{trace_prefix}responses_nonstream_collect_done elapsed={deps.fmt_ms(request_t0)} "
         f"out_chars={len(full_content)} usage_total={usage.get('total_tokens', 0)} status={status or '-'}"
     )
     return full_content, usage, finish_reason, raw_text
 
 
-async def replay_codex_chat_stream(
+async def replay_responses_as_chat_stream(
     *,
     url: str,
     api_key: str,
@@ -787,13 +787,13 @@ async def replay_codex_chat_stream(
     caller_desc: str,
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
-    deps: CodexUpstreamDeps,
+    deps: ResponsesUpstreamDeps,
     chunk_size: int = 1200,
 ) -> AsyncGenerator[bytes, None]:
-    """Call Codex Responses upstream as true non-stream, replay assistant text as OpenAI SSE."""
+    """Call OpenAI Responses upstream as true non-stream, replay assistant text as OpenAI SSE."""
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
-    stream_id = f"chatcmpl-codex-replay-{uuid.uuid4().hex[:16]}"
+    stream_id = f"chatcmpl-responses-replay-{uuid.uuid4().hex[:16]}"
     created = int(time.time())
     keepalive_interval = 10.0
     keepalive_count = 0
@@ -834,7 +834,7 @@ async def replay_codex_chat_stream(
         last_downstream_emit = now
         keepalive_count += 1
         deps.log(
-            f"{trace_prefix}codex_replay_keepalive "
+            f"{trace_prefix}responses_replay_keepalive "
             f"count={keepalive_count} reason={reason} idle_ms={idle_ms:.1f}"
         )
         return f"data: {json.dumps(make_chunk(), ensure_ascii=True)}\n\n".encode("utf-8")
@@ -843,7 +843,7 @@ async def replay_codex_chat_stream(
         nonlocal saved_log
         if saved_log:
             return
-        raw = raw_text or marker or "[CODEX_NONSTREAM_REPLAY]"
+        raw = raw_text or marker or "[RESPONSES_NONSTREAM_REPLAY]"
         if marker and raw_text:
             raw = f"{raw_text}\n{marker}"
         try:
@@ -863,17 +863,17 @@ async def replay_codex_chat_stream(
             )
             saved_log = True
         except Exception as save_err:
-            deps.log(f"{trace_prefix}codex_replay_log_error err={save_err}")
+            deps.log(f"{trace_prefix}responses_replay_log_error err={save_err}")
 
     if caller_key:
-        deps.log(f"{trace_prefix}codex_replay_owner caller={caller_key} {caller_desc}")
+        deps.log(f"{trace_prefix}responses_replay_owner caller={caller_key} {caller_desc}")
 
     try:
         initial = emit_keepalive("stream_open", force=True)
         if initial:
             yield initial
 
-        collect_task = asyncio.create_task(collect_codex_response_nonstream(
+        collect_task = asyncio.create_task(collect_responses_nonstream(
             url=url,
             api_key=api_key,
             request_data=request_data,
@@ -910,24 +910,24 @@ async def replay_codex_chat_stream(
 
         yield emit_data(make_chunk(finish_reason_value=finish_reason or "stop"))
         yield emit_done()
-        finish_status = "codex_nonstream_replay_completed"
-        persist_log("[CODEX_NONSTREAM_REPLAY_COMPLETED]", full_content or "[empty response]")
+        finish_status = "responses_nonstream_replay_completed"
+        persist_log("[RESPONSES_NONSTREAM_REPLAY_COMPLETED]", full_content or "[empty response]")
     except asyncio.CancelledError:
         finish_status = "downstream_cancelled"
         if collect_task is not None and not collect_task.done():
             collect_task.cancel()
-        persist_log("[CANCELLED: downstream client disconnected during codex nonstream replay]", full_content or "[cancelled before content]", "downstream_cancelled")
+        persist_log("[CANCELLED: downstream client disconnected during Responses nonstream replay]", full_content or "[cancelled before content]", "downstream_cancelled")
         raise
     except Exception as e:
         finish_status = f"exception:{type(e).__name__}"
-        persist_log(f"[CODEX_NONSTREAM_REPLAY_EXCEPTION] {e}", full_content + f"\n[ERROR] {e}" if full_content else f"[ERROR] {e}", "codex_nonstream_replay_error")
-        yield deps.build_openai_sse_error(502, str(e), "codex_nonstream_replay_error")
+        persist_log(f"[RESPONSES_NONSTREAM_REPLAY_EXCEPTION] {e}", full_content + f"\n[ERROR] {e}" if full_content else f"[ERROR] {e}", "responses_nonstream_replay_error")
+        yield deps.build_openai_sse_error(502, str(e), "responses_nonstream_replay_error")
         yield emit_done()
     finally:
         if caller_key:
             deps.release_caller(caller_key, trace_id)
         deps.log(
-            f"{trace_prefix}codex_nonstream_replay_done reason={finish_status} "
+            f"{trace_prefix}responses_nonstream_replay_done reason={finish_status} "
             f"elapsed={deps.fmt_ms(request_t0)} out_chars={len(full_content)} "
             f"usage_total={usage.get('total_tokens', 0)} keepalives={keepalive_count}"
         )

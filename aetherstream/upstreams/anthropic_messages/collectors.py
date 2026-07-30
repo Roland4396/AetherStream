@@ -12,10 +12,10 @@ from .protocol import (
     _normalize_usage,
 )
 from .transport import _close_upstream_stream, _prime_code_cli_connection
-from .types import AnthropicUpstreamDeps
+from .types import AnthropicMessagesDeps
 
 
-async def collect_anthropic_chat_completion(
+async def collect_anthropic_messages_as_chat_completion(
     *,
     url: str,
     request_data: dict[str, Any],
@@ -25,7 +25,7 @@ async def collect_anthropic_chat_completion(
     trace_id: str,
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
 ) -> tuple[str, str, dict[str, Any], str, str]:
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
@@ -166,7 +166,7 @@ async def collect_anthropic_chat_completion(
         )
 
 
-async def collect_anthropic_message_response(
+async def collect_anthropic_messages_response(
     *,
     url: str,
     request_data: dict[str, Any],
@@ -174,7 +174,7 @@ async def collect_anthropic_message_response(
     model: str,
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
     trace_id: str = "",
 ) -> tuple[dict[str, Any], str]:
     request_t0 = time.perf_counter()

@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .types import AnthropicUpstreamDeps
+from .types import AnthropicMessagesDeps
 
 
 def _is_async_generator_close_race(exc: BaseException) -> bool:
@@ -34,7 +34,7 @@ async def _close_upstream_stream(
     *,
     response: httpx.Response | None,
     client: httpx.AsyncClient | None,
-    deps: "AnthropicUpstreamDeps",
+    deps: "AnthropicMessagesDeps",
     trace_prefix: str,
     label: str,
     reason: str,
@@ -103,7 +103,7 @@ async def _prime_code_cli_connection(
     *,
     client: httpx.AsyncClient,
     url: str,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
     trace_prefix: str = "",
 ) -> None:
     prime_url = _build_code_cli_prime_url(url)

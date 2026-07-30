@@ -1,4 +1,4 @@
-"""GPT/Codex request policy injection and prompt-cache helpers."""
+"""GPT/Responses request policy injection and prompt-cache helpers."""
 
 import copy
 import hashlib
@@ -26,7 +26,7 @@ def _responses_text_from_content(content: Any) -> str:
 
 
 def inject_gpt_usage_policies_system_message(request_data: dict) -> dict:
-    """Return a copy with usage policies forced as messages[0] for GPT/Codex only."""
+    """Return a copy with usage policies forced as messages[0] for GPT/Responses only."""
     copied = copy.deepcopy(request_data)
     messages = copied.get('messages')
     if not isinstance(messages, list):

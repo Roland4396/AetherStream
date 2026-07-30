@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from aetherstream.api.dependencies import RouteDependencies, build_route_dependencies
 from aetherstream.features.replay import ReplayPreparationError
@@ -18,10 +18,44 @@ from aetherstream.features.request_injections import (
     apply_forced_opus_note,
     apply_pioneer_opus_note,
 )
+from aetherstream.streaming.json_keepalive import keepalive_json_response
+from aetherstream.streaming.responses import DisconnectSafeStreamingResponse as StreamingResponse
 
 
 def _is_pioneer_auto_model(model: Any) -> bool:
     return str(model or '').strip().lower() in {'pioneer/auto', 'anthropic/pioneer-auto'}
+
+
+def _drop_configured_request_fields(payload: dict[str, Any], route: dict[str, Any]) -> list[str]:
+    fields = route.get('drop_request_fields')
+    if not isinstance(fields, list):
+        return []
+
+    removed: list[str] = []
+    for raw_field in fields:
+        field = str(raw_field or '').strip()
+        if field and field in payload:
+            payload.pop(field, None)
+            removed.append(field)
+    return removed
+
+
+def _apply_configured_template_thinking(payload: dict[str, Any], route: dict[str, Any]) -> bool:
+    enabled = route.get('enable_thinking')
+    if not isinstance(enabled, bool):
+        return False
+
+    kwargs = payload.get('chat_template_kwargs')
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+    if kwargs.get('enable_thinking') is enabled:
+        payload['chat_template_kwargs'] = kwargs
+        return False
+
+    kwargs = dict(kwargs)
+    kwargs['enable_thinking'] = enabled
+    payload['chat_template_kwargs'] = kwargs
+    return True
 
 
 async def chat_completions(request: Request, deps: RouteDependencies):
@@ -186,7 +220,9 @@ async def chat_completions(request: Request, deps: RouteDependencies):
             )
 
         is_free_model, free_real_model = deps.parse_free_provider_prefix(model)
-        if is_free_model:
+        # Free-pool Claude models require the Anthropic Messages API. Leave
+        # those for the Claude shim below; this branch is OpenAI-compatible.
+        if is_free_model and not deps.model_policy.is_claude_model(model):
             free_upstream_key, free_upstream_base = deps.get_claude_upstream_for_provider('free')
             if not free_upstream_key:
                 if stream:
@@ -245,12 +281,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 if free_is_gemini:
                     outbound_data['stream'] = False
                     return StreamingResponse(
-                        deps.forward_non_stream_as_openai_stream(
+                        deps.replay_chat_completions_nonstream_as_stream(
                             url=target_url,
                             request_data=outbound_data,
                             headers=headers,
                             timeout=deps.get_timeout_config(),
-                            deps=deps.build_openai_upstream_deps(),
+                            deps=deps.build_chat_completions_upstream_deps(),
                             model=model,
                             messages=data.get('messages', []),
                             trace_id=trace_id,
@@ -262,13 +298,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
 
                 outbound_data['stream'] = True
                 return StreamingResponse(
-                    deps.forward_stream(
+                    deps.forward_chat_completions_stream(
                         url=target_url,
                         request_data=outbound_data,
                         headers=headers,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=deps.build_openai_upstream_deps(),
+                        deps=deps.build_chat_completions_upstream_deps(),
                         enable_early_stop=False,
                         model=model,
                         messages=data.get('messages', []),
@@ -285,12 +321,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     dedupe_key = deps.build_exact_request_key(outbound_data)
 
                     async def _run_free_openai_nonstream():
-                        collected = await deps.collect_non_stream(
+                        collected = await deps.collect_chat_completions_nonstream(
                             url=target_url,
                             request_data=outbound_data,
                             headers=headers,
                             timeout=deps.get_timeout_config(),
-                            deps=deps.build_openai_upstream_deps(),
+                            deps=deps.build_chat_completions_upstream_deps(),
                             trace_id=trace_id,
                         )
                         return collected[5]
@@ -320,13 +356,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     return JSONResponse(upstream_nonstream_payload)
 
                 outbound_data['stream'] = True
-                full_content, model_name, usage, finish_reason, raw_sse = await deps.collect_stream(
+                full_content, model_name, usage, finish_reason, raw_sse = await deps.collect_chat_completions_stream(
                     url=target_url,
                     request_data=outbound_data,
                     headers=headers,
                     timeout=deps.get_timeout_config(),
                     max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                    deps=deps.build_openai_upstream_deps(),
+                    deps=deps.build_chat_completions_upstream_deps(),
                     enable_early_stop=False,
                     trace_id=trace_id,
                 )
@@ -383,6 +419,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
             base_url = str(directory_route.get('base_url') or '').rstrip('/')
             target_url = f"{base_url}/chat/completions"
             outbound_data = copy.deepcopy(data)
+            dropped_fields = _drop_configured_request_fields(outbound_data, directory_route)
+            if dropped_fields:
+                deps.log(
+                    f"{trace_prefix} model-directory_request_compat "
+                    f"name={route_name} model={model} "
+                    f"removed={','.join(dropped_fields)}"
+                )
             directory_is_pioneer_upstream = bool(directory_route.get('pioneer_upstream') or directory_route.get('pioneer_router'))
             if directory_is_pioneer_upstream:
                 outbound_data.pop('models ', None)
@@ -395,12 +438,30 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     is_opus_model=deps.is_claude_opus_model,
                     log=deps.log,
                 )
-            if deps.apply_openai_template_thinking_disabled(outbound_data, model):
+            thinking_override = directory_route.get('enable_thinking')
+            if isinstance(thinking_override, bool):
+                changed = _apply_configured_template_thinking(outbound_data, directory_route)
+                deps.log(
+                    f"{trace_prefix} model-directory_template_thinking "
+                    f"name={route_name} model={model} enabled={str(thinking_override).lower()} "
+                    f"changed={str(changed).lower()}"
+                )
+            elif deps.apply_openai_template_thinking_disabled(outbound_data, model):
                 deps.log(
                     f"{trace_prefix} model-directory_disable_template_thinking "
                     f"name={route_name} model={model}"
                 )
-            if deps.should_append_pro_opus46_last_user_note(route_name, base_url, model):
+            route_forces_opus_note = bool(directory_route.get('inject_opus_note'))
+            if route_forces_opus_note:
+                apply_forced_opus_note(
+                    outbound_data,
+                    selected_model=model,
+                    trace_prefix=trace_prefix,
+                    route_label='model_directory_configured_opus',
+                    log=deps.log,
+                    log_context=f'name={route_name}',
+                )
+            if not route_forces_opus_note and deps.should_append_pro_opus46_last_user_note(route_name, base_url, model):
                 apply_forced_opus_note(
                     outbound_data,
                     selected_model=model,
@@ -469,12 +530,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         f"name={route_name} model={model}"
                     )
                     return StreamingResponse(
-                        deps.forward_non_stream_as_openai_stream(
+                        deps.replay_chat_completions_nonstream_as_stream(
                             url=target_url,
                             request_data=outbound_data,
                             headers=headers,
                             timeout=deps.get_timeout_config(),
-                            deps=deps.build_openai_upstream_deps(),
+                            deps=deps.build_chat_completions_upstream_deps(),
                             model=model,
                             messages=data.get('messages', []),
                             trace_id=trace_id,
@@ -485,13 +546,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     )
 
                 return StreamingResponse(
-                    deps.forward_stream(
+                    deps.forward_chat_completions_stream(
                         url=target_url,
                         request_data=outbound_data,
                         headers=headers,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=deps.build_openai_upstream_deps(),
+                        deps=deps.build_chat_completions_upstream_deps(),
                         enable_early_stop=False,
                         model=model,
                         messages=data.get('messages', []),
@@ -514,12 +575,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     )
 
                     async def _run_plain_nonstream():
-                        collected = await deps.collect_non_stream(
+                        collected = await deps.collect_chat_completions_nonstream(
                             url=target_url,
                             request_data=outbound_data,
                             headers=headers,
                             timeout=deps.get_timeout_config(),
-                            deps=deps.build_openai_upstream_deps(),
+                            deps=deps.build_chat_completions_upstream_deps(),
                             trace_id=trace_id,
                         )
                         return collected[5]
@@ -547,13 +608,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                             f"key={dedupe_key[:16]} out_chars={len(full_content)}"
                         )
                 else:
-                    full_content, model_name, usage, finish_reason, raw_response = await deps.collect_stream(
+                    full_content, model_name, usage, finish_reason, raw_response = await deps.collect_chat_completions_stream(
                         url=target_url,
                         request_data=outbound_data,
                         headers=headers,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=deps.build_openai_upstream_deps(),
+                        deps=deps.build_chat_completions_upstream_deps(),
                         enable_early_stop=False,
                         trace_id=trace_id,
                     )
@@ -633,13 +694,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     f"blocks={filter_stats['blocks']} chars={filter_stats['chars']} "
                     f"mode=closed_tags_and_bare_image_prompts"
                 )
-            gemini_config = deps.build_gemini_upstream_config()
-            gemini_deps = deps.build_gemini_upstream_deps()
+            gemini_config = deps.build_gemini_generate_content_config()
+            gemini_deps = deps.build_gemini_generate_content_deps()
 
             if stream:
                 data['stream'] = True
                 return StreamingResponse(
-                    deps.forward_gemini_stream(
+                    deps.forward_gemini_generate_content_stream(
                         model=model,
                         openai_request=data,
                         config=gemini_config,
@@ -655,7 +716,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 dedupe_key = deps.build_exact_request_key(data)
 
                 async def _run_gemini_nonstream():
-                    full_content_inner, usage_inner, finish_reason_inner = await deps.collect_gemini_non_stream(
+                    full_content_inner, usage_inner, finish_reason_inner = await deps.collect_gemini_generate_content(
                         model=model,
                         openai_request=data,
                         config=gemini_config,
@@ -862,7 +923,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                             f"chars={system_fold_meta.get('chars')}"
                         )
                 return StreamingResponse(
-                    deps.forward_anthropic_chat_stream(
+                    deps.forward_anthropic_messages_as_chat_stream(
                         url=claude_url,
                         request_data=claude_request,
                         headers=claude_headers,
@@ -873,7 +934,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         caller_desc=caller_desc,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=deps.build_anthropic_upstream_deps(),
+                        deps=deps.build_anthropic_messages_deps(),
                         cache_keepalive=prompt_cache_keepalive_cfg if prompt_cache_keepalive_enabled_for_model else None,
                     ),
                     media_type='text/event-stream'
@@ -891,7 +952,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                             f"blocks={system_fold_meta.get('blocks')} "
                             f"chars={system_fold_meta.get('chars')}"
                         )
-                full_content, model_name, usage, finish_reason, raw_response = await deps.collect_anthropic_chat_completion(
+                full_content, model_name, usage, finish_reason, raw_response = await deps.collect_anthropic_messages_as_chat_completion(
                     url=claude_url,
                     request_data=claude_request,
                     headers=claude_headers,
@@ -900,7 +961,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     trace_id=trace_id,
                     timeout=deps.get_timeout_config(),
                     max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                    deps=deps.build_anthropic_upstream_deps(),
+                    deps=deps.build_anthropic_messages_deps(),
                 )
                 deps.save_request_log(
                     model,
@@ -954,17 +1015,17 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     status_code=502
                 )
 
-        # GPT：对齐 Codex CLI，默认将 Chat Completions 入站转为 Responses 上游。
+        # GPT：将 Chat Completions 入站转换为 OpenAI Responses 上游。
         outbound_data = data
 
         if deps.model_policy.is_gpt_model(model):
             outbound_data = deps.inject_gpt_usage_policies_system_message(data)
             deps.log(f"{trace_prefix} gpt_usage_policies_system_injected first_system=yes")
-            if not deps.CODEX_API_KEY:
+            if not deps.RESPONSES_API_KEY:
                 if stream:
                     deps.release_active_stream_caller(caller_key, trace_id)
                 return JSONResponse(
-                    {"error": {"message": "CODEX_API_KEY is missing", "type": "config_error"}},
+                    {"error": {"message": "RESPONSES_API_KEY is missing", "type": "config_error"}},
                     status_code=500
                 )
 
@@ -980,14 +1041,14 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     outbound_data.setdefault('prompt_cache_retention', deps.GPT_PROMPT_CACHE_RETENTION)
                 reasoning = outbound_data.get('reasoning')
                 outbound_data['reasoning'] = dict(reasoning) if isinstance(reasoning, dict) else {}
-                configured_effort = str(deps.CODEX_REASONING_EFFORT or '').strip().lower()
+                configured_effort = str(deps.RESPONSES_REASONING_EFFORT or '').strip().lower()
                 outbound_data['reasoning']['effort'] = 'max' if configured_effort == 'ultra' else configured_effort
                 if configured_effort == 'ultra':
                     outbound_data['reasoning']['context'] = 'all_turns'
-                if deps.CODEX_REASONING_SUMMARY:
-                    outbound_data['reasoning'].setdefault('summary', deps.CODEX_REASONING_SUMMARY)
+                if deps.RESPONSES_REASONING_SUMMARY:
+                    outbound_data['reasoning'].setdefault('summary', deps.RESPONSES_REASONING_SUMMARY)
 
-                codex_deps = deps.build_codex_upstream_deps()
+                responses_deps = deps.build_responses_upstream_deps()
                 deps.log(
                     f"{trace_prefix} Route to GPT Responses upstream /v1/responses: "
                     f"{model} service_tier={outbound_data.get('service_tier', '-')} "
@@ -1002,9 +1063,9 @@ async def chat_completions(request: Request, deps: RouteDependencies):
 
                 if stream:
                     return StreamingResponse(
-                        deps.forward_codex_chat_stream(
-                            url=deps.CODEX_BASE_URL,
-                            api_key=deps.CODEX_API_KEY,
+                        deps.forward_responses_as_chat_stream(
+                            url=deps.RESPONSES_BASE_URL,
+                            api_key=deps.RESPONSES_API_KEY,
                             request_data=outbound_data,
                             model=model,
                             messages=data.get('messages', []),
@@ -1013,22 +1074,22 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                             caller_desc=caller_desc,
                             timeout=deps.get_timeout_config(),
                             max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                            deps=codex_deps,
+                            deps=responses_deps,
                         ),
                         media_type='text/event-stream'
                     )
 
                 try:
-                    full_content, usage, finish_reason = await deps.collect_codex_chat_completion(
-                        url=deps.CODEX_BASE_URL,
-                        api_key=deps.CODEX_API_KEY,
+                    full_content, usage, finish_reason = await deps.collect_responses_as_chat_completion(
+                        url=deps.RESPONSES_BASE_URL,
+                        api_key=deps.RESPONSES_API_KEY,
                         request_data=outbound_data,
                         model=model,
                         messages=data.get('messages', []),
                         trace_id=trace_id,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=codex_deps,
+                        deps=responses_deps,
                     )
                     return JSONResponse({
                         "id": f"chatcmpl-{uuid.uuid4()}",
@@ -1067,7 +1128,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
 
             headers = {
                 'Content-Type': 'application/json',
-                'Authorization': f'Bearer {deps.CODEX_API_KEY}',
+                'Authorization': f'Bearer {deps.RESPONSES_API_KEY}',
             }
             outbound_data = dict(outbound_data)
             if deps.GPT_SERVICE_TIER:
@@ -1081,13 +1142,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
             if stream:
                 outbound_data['stream'] = True
                 return StreamingResponse(
-                    deps.forward_stream(
+                    deps.forward_chat_completions_stream(
                         url=deps.GPT_BASE_URL,
                         request_data=outbound_data,
                         headers=headers,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=deps.build_openai_upstream_deps(),
+                        deps=deps.build_chat_completions_upstream_deps(),
                         enable_early_stop=False,
                         model=model,
                         messages=data.get('messages', []),
@@ -1099,13 +1160,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 )
 
             try:
-                full_content, model_name, usage, finish_reason, raw_sse = await deps.collect_stream(
+                full_content, model_name, usage, finish_reason, raw_sse = await deps.collect_chat_completions_stream(
                     url=deps.GPT_BASE_URL,
                     request_data=outbound_data,
                     headers=headers,
                     timeout=deps.get_timeout_config(),
                     max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                    deps=deps.build_openai_upstream_deps(),
+                    deps=deps.build_chat_completions_upstream_deps(),
                     enable_early_stop=False,
                     trace_id=trace_id,
                 )
@@ -1155,12 +1216,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     status_code=502
                 )
 
-        if deps.model_policy.is_codex_model(model):
-            removed_fields = deps.model_policy.apply_codex_reasoning(data)
+        if deps.model_policy.is_responses_model(model):
+            removed_fields = deps.model_policy.apply_responses_compat(data)
             outbound_data = deps.convert_chat_to_responses_request(data)
             if removed_fields:
                 deps.log(
-                    "Codex responses shim: "
+                    "OpenAI Responses shim: "
                     f"model={model}, "
                     f"input_items={len(outbound_data.get('input', []))}, "
                     f"instructions={'yes' if outbound_data.get('instructions') else 'no'}, "
@@ -1168,29 +1229,29 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 )
             else:
                 deps.log(
-                    "Codex responses shim: "
+                    "OpenAI Responses shim: "
                     f"model={model}, "
                     f"input_items={len(outbound_data.get('input', []))}, "
                     f"instructions={'yes' if outbound_data.get('instructions') else 'no'}"
                 )
-            if not deps.CODEX_API_KEY:
+            if not deps.RESPONSES_API_KEY:
                 if stream:
                     deps.release_active_stream_caller(caller_key, trace_id)
                 return JSONResponse(
-                    {"error": {"message": "CODEX_API_KEY is missing", "type": "config_error"}},
+                    {"error": {"message": "RESPONSES_API_KEY is missing", "type": "config_error"}},
                     status_code=500
                 )
 
             outbound_data = dict(outbound_data)
             outbound_data['stream'] = True
-            codex_deps = deps.build_codex_upstream_deps()
-            deps.log(f"{trace_prefix} Route to Codex upstream /v1/responses: {model} since_enter={deps.fmt_ms(route_t0)}")
+            responses_deps = deps.build_responses_upstream_deps()
+            deps.log(f"{trace_prefix} Route to OpenAI Responses upstream /v1/responses: {model} since_enter={deps.fmt_ms(route_t0)}")
 
             if stream:
                 return StreamingResponse(
-                    deps.forward_codex_chat_stream(
-                        url=deps.CODEX_BASE_URL,
-                        api_key=deps.CODEX_API_KEY,
+                    deps.forward_responses_as_chat_stream(
+                        url=deps.RESPONSES_BASE_URL,
+                        api_key=deps.RESPONSES_API_KEY,
                         request_data=outbound_data,
                         model=model,
                         messages=data.get('messages', []),
@@ -1199,21 +1260,21 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         caller_desc=caller_desc,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=codex_deps,
+                        deps=responses_deps,
                     ),
                     media_type='text/event-stream'
                 )
 
-            full_content, usage, finish_reason = await deps.collect_codex_chat_completion(
-                url=deps.CODEX_BASE_URL,
-                api_key=deps.CODEX_API_KEY,
+            full_content, usage, finish_reason = await deps.collect_responses_as_chat_completion(
+                url=deps.RESPONSES_BASE_URL,
+                api_key=deps.RESPONSES_API_KEY,
                 request_data=outbound_data,
                 model=model,
                 messages=data.get('messages', []),
                 trace_id=trace_id,
                 timeout=deps.get_timeout_config(),
                 max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                deps=codex_deps,
+                deps=responses_deps,
             )
             return JSONResponse({
                 "id": f"chatcmpl-{uuid.uuid4()}",
@@ -1268,13 +1329,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
             if stream:
                 outbound_data['stream'] = True
                 return StreamingResponse(
-                    deps.forward_stream(
+                    deps.forward_chat_completions_stream(
                         url=target_url,
                         request_data=outbound_data,
                         headers=headers,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=deps.build_openai_upstream_deps(),
+                        deps=deps.build_chat_completions_upstream_deps(),
                         enable_early_stop=False,
                         model=model,
                         messages=data.get('messages', []),
@@ -1285,13 +1346,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     media_type='text/event-stream'
                 )
             try:
-                full_content, model_name, usage, finish_reason, raw_sse = await deps.collect_stream(
+                full_content, model_name, usage, finish_reason, raw_sse = await deps.collect_chat_completions_stream(
                     url=target_url,
                     request_data=outbound_data,
                     headers=headers,
                     timeout=deps.get_timeout_config(),
                     max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                    deps=deps.build_openai_upstream_deps(),
+                    deps=deps.build_chat_completions_upstream_deps(),
                     enable_early_stop=False,
                     trace_id=trace_id,
                 )
@@ -1389,10 +1450,10 @@ async def chat_completions(request: Request, deps: RouteDependencies):
 
 CHAT_DEPENDENCY_NAMES = (
     'CLAUDE_DEFAULT_MAX_TOKENS',
-    'CODEX_API_KEY',
-    'CODEX_BASE_URL',
-    'CODEX_REASONING_EFFORT',
-    'CODEX_REASONING_SUMMARY',
+    'RESPONSES_API_KEY',
+    'RESPONSES_BASE_URL',
+    'RESPONSES_REASONING_EFFORT',
+    'RESPONSES_REASONING_SUMMARY',
     'GEMINI_API_KEY',
     'GEMINI_ENABLED',
     'GPT_BASE_URL',
@@ -1410,37 +1471,37 @@ CHAT_DEPENDENCY_NAMES = (
     'apply_drawing_context_filter',
     'apply_openai_template_thinking_disabled',
     'apply_pro_no_reasoning_payload',
-    'build_anthropic_upstream_deps',
+    'build_anthropic_messages_deps',
     'build_caller_fingerprint',
     'build_claude_messages_url',
     'build_claude_prompt_cache_control',
     'build_claude_system_prefix',
     'build_claude_upstream_headers',
-    'build_codex_upstream_deps',
+    'build_responses_upstream_deps',
     'build_exact_request_key',
     'build_free_openai_chat_url',
     'build_free_openai_headers',
-    'build_gemini_upstream_config',
-    'build_gemini_upstream_deps',
+    'build_gemini_generate_content_config',
+    'build_gemini_generate_content_deps',
     'build_gpt_prompt_cache_key',
-    'build_openai_upstream_deps',
+    'build_chat_completions_upstream_deps',
     'build_timed_claude_user_id',
-    'collect_anthropic_chat_completion',
-    'collect_codex_chat_completion',
-    'collect_gemini_non_stream',
-    'collect_non_stream',
-    'collect_stream',
+    'collect_anthropic_messages_as_chat_completion',
+    'collect_responses_as_chat_completion',
+    'collect_gemini_generate_content',
+    'collect_chat_completions_nonstream',
+    'collect_chat_completions_stream',
     'convert_chat_to_anthropic_messages_request',
     'convert_chat_to_responses_request',
     'extract_openai_chat_payload_content',
     'fake_slow_openai_stream',
     'fmt_ms',
     'fold_claude_system_into_first_user_message',
-    'forward_anthropic_chat_stream',
-    'forward_codex_chat_stream',
-    'forward_gemini_stream',
-    'forward_non_stream_as_openai_stream',
-    'forward_stream',
+    'forward_anthropic_messages_as_chat_stream',
+    'forward_responses_as_chat_stream',
+    'forward_gemini_generate_content_stream',
+    'replay_chat_completions_nonstream_as_stream',
+    'forward_chat_completions_stream',
     'get_claude_cache_keepalive_settings',
     'get_claude_prompt_caching_settings',
     'get_claude_upstream_for_provider',
@@ -1473,9 +1534,23 @@ CHAT_DEPENDENCY_NAMES = (
 
 def register_routes(app, ctx: dict[str, Any]) -> RouteDependencies:
     deps = build_route_dependencies(ctx, CHAT_DEPENDENCY_NAMES)
+    nonstream_keepalive_interval = float(ctx.get('NONSTREAM_KEEPALIVE_INTERVAL', 10.0))
 
     async def chat_completions_endpoint(request: Request):
-        return await chat_completions(request, deps)
+        try:
+            payload = await request.json()
+        except Exception:
+            return await chat_completions(request, deps)
+
+        if not isinstance(payload, dict) or payload.get('stream', False):
+            return await chat_completions(request, deps)
+
+        return keepalive_json_response(
+            lambda: chat_completions(request, deps),
+            interval=nonstream_keepalive_interval,
+            trace_id=getattr(request.state, 'trace_id', ''),
+            log=deps.log,
+        )
 
     app.post('/v1/chat/completions')(chat_completions_endpoint)
     return deps

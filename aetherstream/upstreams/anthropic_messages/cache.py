@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 from .transport import _prime_code_cli_connection
-from .types import AnthropicUpstreamDeps
+from .types import AnthropicMessagesDeps
 
 
 @dataclass
@@ -190,7 +190,7 @@ def _build_claude_cache_fingerprint(model: str, request_data: dict[str, Any]) ->
 def _cancel_claude_cache_post_keepalive(
     *,
     post_key: str,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
     trace_prefix: str,
     reason: str,
 ) -> None:
@@ -229,7 +229,7 @@ async def _run_claude_cache_keepalive_once(
     headers: dict[str, str],
     model: str,
     trace_id: str,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
     max_tokens: int = 1,
     first_data_timeout_sec: float = 60.0,
     close_after_data_events: int = 1,
@@ -364,7 +364,7 @@ async def _run_claude_cache_keepalive_loop(
     headers: dict[str, str],
     model: str,
     trace_id: str,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
     interval_sec: float,
     max_tokens: int,
     first_data_timeout_sec: float,
@@ -433,7 +433,7 @@ async def _run_claude_cache_post_keepalive_after_delay(
     headers: dict[str, str],
     model: str,
     trace_id: str,
-    deps: AnthropicUpstreamDeps,
+    deps: AnthropicMessagesDeps,
     max_tokens: int,
     first_data_timeout_sec: float,
     close_after_data_events: int,

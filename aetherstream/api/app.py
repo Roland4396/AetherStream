@@ -21,40 +21,41 @@ from typing import Any, AsyncGenerator
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
+from aetherstream.api.audio_routes import register_routes as register_audio_routes
 from aetherstream.api.admin_routes import register_routes as register_admin_routes
 from aetherstream.api.chat_routes import register_routes as register_chat_routes
 from aetherstream.api.messages_routes import register_routes as register_messages_routes
 from aetherstream.api.system_routes import register_routes as register_system_routes
 from aetherstream.config.urls import (
-    normalize_codex_responses_base_url,
+    normalize_openai_responses_base_url,
     normalize_openai_chat_base_url,
 )
 from aetherstream.runtime.docker_control import DockerContainerRestarter
 from aetherstream.runtime.flags import RuntimeFlags
-from aetherstream.upstreams.anthropic import AnthropicUpstreamDeps, forward_anthropic_stream
-from aetherstream.upstreams.anthropic import (
-    collect_anthropic_chat_completion,
-    collect_anthropic_message_response,
-    forward_anthropic_chat_stream,
+from aetherstream.upstreams.anthropic_messages import AnthropicMessagesDeps, forward_anthropic_messages_stream
+from aetherstream.upstreams.anthropic_messages import (
+    collect_anthropic_messages_as_chat_completion,
+    collect_anthropic_messages_response,
+    forward_anthropic_messages_as_chat_stream,
 )
-from aetherstream.upstreams.codex import (
-    CodexUpstreamDeps,
-    collect_codex_chat_completion,
-    forward_codex_chat_stream,
+from aetherstream.upstreams.openai_responses import (
+    ResponsesUpstreamDeps,
+    collect_responses_as_chat_completion,
+    forward_responses_as_chat_stream,
 )
-from aetherstream.upstreams.gemini import (
-    GeminiUpstreamConfig,
-    GeminiUpstreamDeps,
-    collect_gemini_non_stream,
-    forward_gemini_stream,
+from aetherstream.upstreams.gemini_generate_content import (
+    GeminiGenerateContentConfig,
+    GeminiGenerateContentDeps,
+    collect_gemini_generate_content,
+    forward_gemini_generate_content_stream,
 )
 from aetherstream.routing.model_policy import ModelPolicy
-from aetherstream.upstreams.openai import (
-    OpenAIUpstreamDeps,
-    collect_non_stream,
-    collect_stream,
-    forward_non_stream_as_openai_stream,
-    forward_stream,
+from aetherstream.upstreams.openai_chat_completions import (
+    ChatCompletionsUpstreamDeps,
+    collect_chat_completions_nonstream,
+    collect_chat_completions_stream,
+    replay_chat_completions_nonstream_as_stream,
+    forward_chat_completions_stream,
 )
 from aetherstream.observability.logging import ProxyLogger
 from aetherstream.observability.summaries import (
@@ -100,15 +101,21 @@ app = FastAPI()
 GEMINI_BASE_URL = os.environ.get('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com').rstrip('/')
 TIMEOUT = int(os.environ.get('TIMEOUT', '600'))
 DEBUG = os.environ.get('DEBUG', 'true').lower() == 'true'
+NONSTREAM_KEEPALIVE_INTERVAL = float(os.environ.get('NONSTREAM_KEEPALIVE_INTERVAL', '10'))
 # 原始 SSE 日志不截断。保留变量仅兼容各 upstream 函数签名。
 MAX_RAW_SSE_BYTES = int(os.environ.get('MAX_RAW_SSE_BYTES', '0'))
 # 保留旧环境变量读取，兼容历史配置；NewAPI fallback 已移除，不再用于上游转发。
 FIXED_API_KEY = os.environ.get('FIXED_API_KEY', '')
+TTS_UPSTREAM_URL = os.environ.get('TTS_UPSTREAM_URL', 'http://127.0.0.1:18881').rstrip('/')
+TTS_MAX_REQUEST_BYTES = int(os.environ.get('TTS_MAX_REQUEST_BYTES', '65536'))
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-CODEX_API_KEY = os.environ.get('CODEX_API_KEY', '')
-RAW_CODEX_BASE_URL = os.environ.get('CODEX_BASE_URL', 'https://api.openai.com/v1')
-GPT_BASE_URL = normalize_openai_chat_base_url(RAW_CODEX_BASE_URL)
-CODEX_BASE_URL = normalize_codex_responses_base_url(RAW_CODEX_BASE_URL)
+RESPONSES_API_KEY = os.environ.get('RESPONSES_API_KEY', os.environ.get('CODEX_API_KEY', ''))
+RAW_RESPONSES_BASE_URL = os.environ.get(
+    'RESPONSES_BASE_URL',
+    os.environ.get('CODEX_BASE_URL', 'https://api.openai.com/v1'),
+)
+GPT_BASE_URL = normalize_openai_chat_base_url(RAW_RESPONSES_BASE_URL)
+RESPONSES_BASE_URL = normalize_openai_responses_base_url(RAW_RESPONSES_BASE_URL)
 GPT_USE_RESPONSES = os.environ.get('GPT_USE_RESPONSES', 'true').lower() == 'true'
 GPT_SERVICE_TIER = (os.environ.get('GPT_SERVICE_TIER', 'priority') or '').strip()
 GPT_PROMPT_CACHE_KEY = (os.environ.get('GPT_PROMPT_CACHE_KEY', '') or '').strip()
@@ -121,20 +128,32 @@ GEMINI_INCLUDE_THOUGHTS = os.environ.get('GEMINI_INCLUDE_THOUGHTS', 'false').low
 GEMINI_HEARTBEAT_INTERVAL = int(os.environ.get('GEMINI_HEARTBEAT_INTERVAL', '15'))
 GEMINI_MAX_RETRIES = int(os.environ.get('GEMINI_MAX_RETRIES', '3'))
 GEMINI_RETRY_DELAY = float(os.environ.get('GEMINI_RETRY_DELAY', '1'))
-CODEX_REASONING_EFFORT = os.environ.get('CODEX_REASONING_EFFORT', 'xhigh')
-CODEX_REASONING_SUMMARY = os.environ.get('CODEX_REASONING_SUMMARY', '').strip()
+RESPONSES_REASONING_EFFORT = os.environ.get(
+    'RESPONSES_REASONING_EFFORT',
+    os.environ.get('CODEX_REASONING_EFFORT', 'xhigh'),
+)
+RESPONSES_REASONING_SUMMARY = os.environ.get(
+    'RESPONSES_REASONING_SUMMARY',
+    os.environ.get('CODEX_REASONING_SUMMARY', ''),
+).strip()
 CLAUDE_API_KEY = os.environ.get('CLAUDE_API_KEY', os.environ.get('ANTHROPIC_API_KEY', ''))
 CLAUDE_BASE_URL = os.environ.get('CLAUDE_BASE_URL', os.environ.get('ANTHROPIC_BASE_URL', 'https://api.anthropic.com')).rstrip('/')
 
-# Claude provider prefixes: free/ → CLAUDE_*, codecli/ → CLAUDE2_*.
+# Claude provider prefixes: free/ → CLAUDE_FREE_*, codecli/ → CLAUDE2_*.
 # Important: free/ is a Pioneer/account-pool channel, not an Anthropic-only
 # model family.  Only free/claude-* should use /v1/messages; all other free/*
 # models use OpenAI-compatible /v1/chat/completions through the same pool.
 CLAUDE2_API_KEY = os.environ.get('CLAUDE2_API_KEY', '').strip()
 CLAUDE2_BASE_URL = os.environ.get('CLAUDE2_BASE_URL', '').rstrip('/')
 
+# Dedicated upstream slot for free/, kept separate from the un-prefixed default
+# so repointing one does not move the other.  Empty values fall back to
+# CLAUDE_*, which reproduces the behaviour from before the split.
+CLAUDE_FREE_API_KEY = os.environ.get('CLAUDE_FREE_API_KEY', '').strip()
+CLAUDE_FREE_BASE_URL = os.environ.get('CLAUDE_FREE_BASE_URL', '').rstrip('/')
+
 CLAUDE_PROVIDER_PREFIX_MAP = {
-    'free': {'api_key_attr': 'CLAUDE_API_KEY', 'base_url_attr': 'CLAUDE_BASE_URL'},
+    'free': {'api_key_attr': 'CLAUDE_FREE_API_KEY', 'base_url_attr': 'CLAUDE_FREE_BASE_URL'},
     'codecli': {'api_key_attr': 'CLAUDE2_API_KEY', 'base_url_attr': 'CLAUDE2_BASE_URL'},
 }
 
@@ -157,7 +176,13 @@ def get_claude_upstream_for_provider(provider: str) -> tuple[str, str]:
     """Return (api_key, base_url) for the given provider prefix."""
     if provider == 'codecli':
         return CLAUDE2_API_KEY, CLAUDE2_BASE_URL
-    # default / 'free'
+    if provider == 'free':
+        # Fall back as a pair.  A half-configured slot must never pair the
+        # dedicated base URL with the default upstream's credential.
+        if CLAUDE_FREE_BASE_URL:
+            return CLAUDE_FREE_API_KEY, CLAUDE_FREE_BASE_URL
+        return CLAUDE_API_KEY, CLAUDE_BASE_URL
+    # default (no prefix)
     return CLAUDE_API_KEY, CLAUDE_BASE_URL
 
 
@@ -350,6 +375,9 @@ def get_openai_compatible_upstreams() -> list[dict[str, Any]]:
             'api_key_env': api_key_env,
             'include_models': _coerce_string_list(item.get('include_models'), []),
             'include_model_families': _coerce_string_list(item.get('include_model_families'), []),
+            'inject_opus_note': _coerce_bool(item.get('inject_opus_note'), False),
+            'drop_request_fields': _coerce_string_list(item.get('drop_request_fields'), []),
+            'enable_thinking': item.get('enable_thinking') if isinstance(item.get('enable_thinking'), bool) else None,
         })
     return upstreams
 
@@ -540,6 +568,8 @@ async def refresh_model_directory(
                         'base_url': base_url,
                         'api_key': upstream.get('api_key') or '',
                         'pioneer_upstream': False,
+                        'inject_opus_note': bool(upstream.get('inject_opus_note')),
+                        'drop_request_fields': list(upstream.get('drop_request_fields') or []),
                     }
                     upstream_model_count += 1
                 log(
@@ -604,6 +634,8 @@ async def refresh_model_directory(
                     'base_url': base_url,
                     'api_key': upstream.get('api_key') or '',
                     'pioneer_upstream': pioneer_router_listing,
+                    'inject_opus_note': bool(upstream.get('inject_opus_note')),
+                    'drop_request_fields': list(upstream.get('drop_request_fields') or []),
                 }
                 upstream_model_count += 1
             log(
@@ -1115,7 +1147,7 @@ active_stream_registry = ActiveStreamRegistry(log=proxy_logger.log)
 NONSTREAM_DEDUPE_TTL = float(os.environ.get('NONSTREAM_DEDUPE_TTL', '180'))
 
 model_policy = ModelPolicy(
-    codex_models=frozenset(),
+    responses_models=frozenset(),
     allowed_gpt_models=frozenset({'gpt-5.6-sol'}),
     allowed_gemini_models=frozenset({'gemini-3.1-pro-preview', 'gemini-3-flash-preview'}),
     allowed_claude_models=frozenset({
@@ -1125,7 +1157,7 @@ model_policy = ModelPolicy(
         'claude-haiku-4-5-20251001',
         'claude-sonnet-4-6',
     }),
-    codex_unsupported_fields=frozenset({'stop', 'presence_penalty', 'frequency_penalty'}),
+    responses_unsupported_fields=frozenset({'stop', 'presence_penalty', 'frequency_penalty'}),
 )
 
 
@@ -1189,6 +1221,14 @@ def build_caller_fingerprint(request: Request) -> tuple[str, str]:
 
 def fmt_ms(start: float, end: float | None = None) -> str:
     return proxy_logger.fmt_ms(start, end)
+
+
+def build_tts_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=15, read=None, write=30, pool=15),
+        follow_redirects=False,
+        trust_env=False,
+    )
 
 
 app.add_middleware(
@@ -1285,8 +1325,8 @@ async def run_exact_nonstream_once(
 
 
 
-def build_codex_upstream_deps() -> CodexUpstreamDeps:
-    return CodexUpstreamDeps(
+def build_responses_upstream_deps() -> ResponsesUpstreamDeps:
+    return ResponsesUpstreamDeps(
         log=log,
         save_request_log=save_request_log,
         build_openai_sse_error=build_openai_sse_error,
@@ -1399,8 +1439,8 @@ def get_timeout_config() -> httpx.Timeout:
 # Upstream Builder Helpers
 # ============================================================
 
-def build_openai_upstream_deps() -> OpenAIUpstreamDeps:
-    return OpenAIUpstreamDeps(
+def build_chat_completions_upstream_deps() -> ChatCompletionsUpstreamDeps:
+    return ChatCompletionsUpstreamDeps(
         log=log,
         save_request_log=save_request_log,
         build_openai_sse_error=build_openai_sse_error,
@@ -1411,8 +1451,8 @@ def build_openai_upstream_deps() -> OpenAIUpstreamDeps:
     )
 
 
-def build_anthropic_upstream_deps() -> AnthropicUpstreamDeps:
-    return AnthropicUpstreamDeps(
+def build_anthropic_messages_deps() -> AnthropicMessagesDeps:
+    return AnthropicMessagesDeps(
         log=log,
         save_request_log=save_request_log,
         build_openai_sse_error=build_openai_sse_error,
@@ -1420,6 +1460,22 @@ def build_anthropic_upstream_deps() -> AnthropicUpstreamDeps:
         find_stop_tag=find_stop_tag,
         fmt_ms=fmt_ms,
         release_caller=release_active_stream_caller,
+        header_keepalive_enabled=_coerce_bool(
+            _runtime_lookup('claude', 'stream', 'header_keepalive', 'enabled'),
+            False,
+        ),
+        header_keepalive_interval_sec=_coerce_positive_float(
+            _runtime_lookup('claude', 'stream', 'header_keepalive', 'seconds'),
+            3.0,
+        ),
+        stream_idle_timeout_enabled=_coerce_bool(
+            _runtime_lookup('claude', 'stream', 'idle_timeout', 'enabled'),
+            False,
+        ),
+        stream_idle_timeout_sec=_coerce_positive_float(
+            _runtime_lookup('claude', 'stream', 'idle_timeout', 'seconds'),
+            4.0,
+        ),
     )
 
 
@@ -1632,8 +1688,8 @@ def apply_claude_output_settings(payload: dict) -> dict:
     return sanitized
 
 
-def build_gemini_upstream_config() -> GeminiUpstreamConfig:
-    return GeminiUpstreamConfig(
+def build_gemini_generate_content_config() -> GeminiGenerateContentConfig:
+    return GeminiGenerateContentConfig(
         base_url=GEMINI_BASE_URL,
         api_key=GEMINI_API_KEY,
         include_thoughts=GEMINI_INCLUDE_THOUGHTS,
@@ -1644,8 +1700,8 @@ def build_gemini_upstream_config() -> GeminiUpstreamConfig:
     )
 
 
-def build_gemini_upstream_deps() -> GeminiUpstreamDeps:
-    return GeminiUpstreamDeps(
+def build_gemini_generate_content_deps() -> GeminiGenerateContentDeps:
+    return GeminiGenerateContentDeps(
         log=log,
         save_request_log=save_request_log,
         build_openai_sse_error=build_openai_sse_error,
@@ -1654,6 +1710,7 @@ def build_gemini_upstream_deps() -> GeminiUpstreamDeps:
 
 messages_route_dependencies = register_messages_routes(app, ctx=globals())
 chat_route_dependencies = register_chat_routes(app, ctx=globals())
+audio_route_dependencies = register_audio_routes(app, ctx=globals())
 system_route_dependencies = register_system_routes(app, ctx=globals())
 admin_route_dependencies = register_admin_routes(app, ctx=globals())
 

@@ -10,7 +10,7 @@ import httpx
 
 
 @dataclass
-class OpenAIUpstreamDeps:
+class ChatCompletionsUpstreamDeps:
     log: Callable[[str], None]
     save_request_log: Callable[..., None]
     build_openai_sse_error: Callable[[int, str, str], bytes]
@@ -156,7 +156,7 @@ async def _close_upstream_stream(
     *,
     response: httpx.Response | None,
     client: httpx.AsyncClient | None,
-    deps: OpenAIUpstreamDeps,
+    deps: ChatCompletionsUpstreamDeps,
     trace_prefix: str,
     label: str,
     reason: str,
@@ -205,7 +205,7 @@ async def _close_upstream_stream(
     )
 
 
-async def replay_openai_chat_stream(
+async def replay_chat_completions_stream(
     *,
     raw_sse_text: str,
     request_data: dict,
@@ -214,7 +214,7 @@ async def replay_openai_chat_stream(
     trace_id: str = "",
     caller_key: str = "",
     caller_desc: str = "",
-    deps: OpenAIUpstreamDeps,
+    deps: ChatCompletionsUpstreamDeps,
     enable_early_stop: bool = True,
 ) -> AsyncGenerator[bytes, None]:
     """Replay a saved OpenAI-compatible chat.completion.chunk SSE log."""
@@ -469,14 +469,14 @@ async def replay_openai_chat_stream(
         )
 
 
-async def forward_stream(
+async def forward_chat_completions_stream(
     *,
     url: str,
     request_data: dict,
     headers: dict,
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
-    deps: OpenAIUpstreamDeps,
+    deps: ChatCompletionsUpstreamDeps,
     enable_early_stop: bool = True,
     model: str = "",
     messages: list | None = None,
@@ -938,13 +938,13 @@ async def forward_stream(
         )
 
 
-async def collect_non_stream(
+async def collect_chat_completions_nonstream(
     *,
     url: str,
     request_data: dict,
     headers: dict,
     timeout: httpx.Timeout,
-    deps: OpenAIUpstreamDeps,
+    deps: ChatCompletionsUpstreamDeps,
     trace_id: str = "",
 ) -> tuple[str, str, dict, str, str, dict[str, Any]]:
     """Collect a plain OpenAI-compatible non-stream chat completion."""
@@ -980,13 +980,13 @@ async def collect_non_stream(
     return full_content, model_name, usage, finish_reason, raw_text, data
 
 
-async def forward_non_stream_as_openai_stream(
+async def replay_chat_completions_nonstream_as_stream(
     *,
     url: str,
     request_data: dict,
     headers: dict,
     timeout: httpx.Timeout,
-    deps: OpenAIUpstreamDeps,
+    deps: ChatCompletionsUpstreamDeps,
     model: str = "",
     messages: list | None = None,
     trace_id: str = "",
@@ -1154,14 +1154,14 @@ async def forward_non_stream_as_openai_stream(
         )
 
 
-async def collect_stream(
+async def collect_chat_completions_stream(
     *,
     url: str,
     request_data: dict,
     headers: dict,
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
-    deps: OpenAIUpstreamDeps,
+    deps: ChatCompletionsUpstreamDeps,
     enable_early_stop: bool = True,
     trace_id: str = "",
 ) -> tuple[str, str, dict, str, str]:

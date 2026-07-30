@@ -7,6 +7,16 @@
     }
   ],
   "claude": {
+    "stream": {
+      "header_keepalive": {
+        "enabled": false,
+        "seconds": 3
+      },
+      "idle_timeout": {
+        "enabled": false,
+        "seconds": 4
+      }
+    },
     "prompt_caching": {
       "enabled": false,
       "type": "ephemeral",

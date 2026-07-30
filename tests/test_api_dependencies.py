@@ -2,7 +2,7 @@ import ast
 import inspect
 import unittest
 
-from aetherstream.api import admin_routes, chat_routes, messages_routes, system_routes
+from aetherstream.api import audio_routes, admin_routes, chat_routes, messages_routes, system_routes
 from aetherstream.api.dependencies import build_route_dependencies
 
 
@@ -24,6 +24,10 @@ class RouteDependenciesTests(unittest.TestCase):
         cases = (
             (chat_routes.chat_completions, chat_routes.CHAT_DEPENDENCY_NAMES),
             (messages_routes.anthropic_messages, messages_routes.MESSAGES_DEPENDENCY_NAMES),
+            (
+                (audio_routes._send_upstream, audio_routes.create_speech, audio_routes.voices),
+                audio_routes.AUDIO_DEPENDENCY_NAMES,
+            ),
             (
                 (
                     admin_routes.admin_claude_replay_state,

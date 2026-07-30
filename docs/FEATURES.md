@@ -9,6 +9,8 @@ an implementation map, not a list of planned features.
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI-compatible chat JSON or SSE |
 | `POST /v1/messages` | Anthropic Messages passthrough |
+| `POST /v1/audio/speech` | Private OpenAI-compatible GPT-SoVITS audio stream |
+| `GET /v1/audio/voices` | Available private GPT-SoVITS voice catalog |
 | `GET /v1/models` | Local and dynamic upstream model directory |
 | `GET /health` | Process liveness |
 | `GET/POST /admin/replay` | Saved-response replay control |
@@ -26,7 +28,7 @@ The chat endpoint currently supports these route families:
 4. Native Gemini HTTP.
 5. Claude and `codecli/` models over Anthropic Messages.
 6. GPT models over Responses or OpenAI Chat.
-7. Explicit Codex/Responses models when configured.
+7. Explicit OpenAI Responses models when configured.
 8. Model-family fallback to a configured OpenAI-compatible upstream.
 
 Saved-response replay is an entry interceptor. It runs before this routing list,
@@ -71,6 +73,7 @@ Project prompt injections live in `features/request_injections.py` and
 - Idempotent caller lifecycle release independent of provider implementation.
 - Partial-output persistence before slow upstream shutdown.
 - Optional early-stop tags and upstream cancellation.
+- TTS downstream-disconnect cancellation while waiting for upstream headers.
 - Optional companion SillyTavern restart after Gemini failures.
 
 ## Logs

@@ -3,11 +3,11 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ModelPolicy:
-    codex_models: frozenset[str]
+    responses_models: frozenset[str]
     allowed_gpt_models: frozenset[str]
     allowed_gemini_models: frozenset[str]
     allowed_claude_models: frozenset[str]
-    codex_unsupported_fields: frozenset[str]
+    responses_unsupported_fields: frozenset[str]
 
     def is_gemini_model(self, model_name: str) -> bool:
         if not model_name:
@@ -22,10 +22,10 @@ class ModelPolicy:
                 return False
         return model_lower.startswith("gemini-") or "gemini" in model_lower
 
-    def is_codex_model(self, model_name: str) -> bool:
+    def is_responses_model(self, model_name: str) -> bool:
         if not model_name:
             return False
-        return model_name in self.codex_models
+        return model_name in self.responses_models
 
     def is_claude_model(self, model_name: str) -> bool:
         if not model_name:
@@ -61,9 +61,9 @@ class ModelPolicy:
         # the actual upstream can decide support.
         return True
 
-    def apply_codex_reasoning(self, request_data: dict) -> list[str]:
+    def apply_responses_compat(self, request_data: dict) -> list[str]:
         removed_fields = []
-        for field in self.codex_unsupported_fields:
+        for field in self.responses_unsupported_fields:
             if field in request_data:
                 request_data.pop(field, None)
                 removed_fields.append(field)

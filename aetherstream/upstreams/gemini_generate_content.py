@@ -11,7 +11,7 @@ import httpx
 
 
 @dataclass
-class GeminiUpstreamConfig:
+class GeminiGenerateContentConfig:
     base_url: str
     api_key: str
     include_thoughts: bool
@@ -22,7 +22,7 @@ class GeminiUpstreamConfig:
 
 
 @dataclass
-class GeminiUpstreamDeps:
+class GeminiGenerateContentDeps:
     log: Callable[[str], None]
     save_request_log: Callable[..., None]
     build_openai_sse_error: Callable[[int, str, str], bytes]
@@ -50,7 +50,7 @@ async def _prime_gemini_connection(
     *,
     client: httpx.AsyncClient,
     base_url: str,
-    deps: GeminiUpstreamDeps,
+    deps: GeminiGenerateContentDeps,
 ) -> None:
     prime_url = _build_gemini_prime_url(base_url)
     if not prime_url:
@@ -67,7 +67,7 @@ async def _prime_gemini_connection(
         deps.log(f"Gemini prime HEAD error: {type(e).__name__}: {e}")
 
 
-def _build_gemini_headers(model: str, config: GeminiUpstreamConfig) -> dict:
+def _build_gemini_headers(model: str, config: GeminiGenerateContentConfig) -> dict:
     return {
         "Content-Type": "application/json",
         "x-goog-api-key": config.api_key,
@@ -159,12 +159,12 @@ def _extract_text_from_gemini_chunk(data: dict) -> tuple[str, str, str | None]:
     return "".join(visible_text_parts), "".join(thought_text_parts), finish_reason
 
 
-async def forward_gemini_stream(
+async def forward_gemini_generate_content_stream(
     *,
     model: str,
     openai_request: dict,
-    config: GeminiUpstreamConfig,
-    deps: GeminiUpstreamDeps,
+    config: GeminiGenerateContentConfig,
+    deps: GeminiGenerateContentDeps,
     messages: list | None = None,
     trace_id: str = "",
 ) -> AsyncGenerator[bytes, None]:
@@ -346,12 +346,12 @@ async def forward_gemini_stream(
         )
 
 
-async def collect_gemini_non_stream(
+async def collect_gemini_generate_content(
     *,
     model: str,
     openai_request: dict,
-    config: GeminiUpstreamConfig,
-    deps: GeminiUpstreamDeps,
+    config: GeminiGenerateContentConfig,
+    deps: GeminiGenerateContentDeps,
     trace_id: str = "",
 ) -> tuple[str, dict, str]:
     """Gemini 非流请求：内部走流式收集。"""

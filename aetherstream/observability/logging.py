@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import sys
 import threading
@@ -7,6 +8,36 @@ import time
 from datetime import datetime
 
 from fastapi import Request
+
+
+class SuccessfulHealthAccessFilter(logging.Filter):
+    """Hide routine successful access lines without masking failures."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+
+        method = str(args[1]).upper()
+        path = str(args[2]).partition('?')[0]
+        try:
+            status_code = int(args[4])
+        except (TypeError, ValueError):
+            return True
+
+        successful = 200 <= status_code < 400
+        routine_request = (
+            (method == 'GET' and path == '/health')
+            or (method == 'POST' and path == '/v1/chat/completions')
+        )
+        return not (successful and routine_request)
+
+
+def install_uvicorn_access_log_filter() -> None:
+    access_logger = logging.getLogger('uvicorn.access')
+    if any(isinstance(item, SuccessfulHealthAccessFilter) for item in access_logger.filters):
+        return
+    access_logger.addFilter(SuccessfulHealthAccessFilter())
 
 
 class ProxyLogger:
@@ -28,6 +59,14 @@ class ProxyLogger:
             return True
 
         lower = msg.lower()
+
+        if (
+            "asgi_done reason=app_returned" in lower
+            and "disconnect_seen=false" in lower
+            and "send_error=-" in lower
+            and "receive_error=-" in lower
+        ):
+            return False
 
         # Always keep failures and disconnects visible.
         if any(token in lower for token in ("error", "exception", "cancelled")):
