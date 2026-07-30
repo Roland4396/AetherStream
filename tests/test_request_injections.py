@@ -3,6 +3,7 @@ import unittest
 from aetherstream.features.opus_notes import (
     PRO_OPUS_LAST_USER_APPEND_MARKER,
     PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
+    PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
 )
 from aetherstream.features.request_injections import (
     ASSISTANT_PREFILL_CONTINUATION_TEXT,
@@ -66,6 +67,8 @@ class RequestInjectionTests(unittest.TestCase):
         content = request["messages"][0]["content"]
         self.assertEqual(content.count(PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER), 3)
         self.assertEqual(content.count(PRO_OPUS_LAST_USER_APPEND_MARKER), 1)
+        self.assertIn(PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT, content)
+        self.assertIn("（记得最后的收尾输出）", content)
 
     def test_pioneer_opus_illustration_falls_back_without_latest_human_tag(self):
         request = {
