@@ -57,7 +57,8 @@
   "early_stop": {
     "enabled": false,
     "tags": [
-      "<disclaimer>"
+      "<disclaimer>",
+      "<closing_leaf>"
     ],
     "case_sensitive": true
   }

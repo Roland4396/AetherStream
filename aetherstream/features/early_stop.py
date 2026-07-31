@@ -6,7 +6,7 @@ from typing import Any
 from aetherstream.utils.coerce import coerce_bool, coerce_string_list
 
 
-DEFAULT_EARLY_STOP_TAGS = ['<!--ST0P_PROXY_', '<disclaimer>']
+DEFAULT_EARLY_STOP_TAGS = ['<!--ST0P_PROXY_', '<disclaimer>', '<closing_leaf>']
 
 
 class EarlyStopMatcher:
