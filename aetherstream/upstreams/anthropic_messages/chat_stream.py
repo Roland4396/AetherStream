@@ -6,6 +6,13 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
+from aetherstream.observability.refusals import AnthropicRefusalDiagnostics
+
+from aetherstream.runtime.tasks import spawn_detached
+
+from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME
+from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection
+
 from .cache import (
     _CLAUDE_CACHE_POST_KEEPALIVE_TASKS,
     _ClaudeCacheKeepaliveLoopState,
@@ -25,7 +32,7 @@ from .protocol import (
     _normalize_usage,
     _truncate_for_stop_tag,
 )
-from .transport import _is_async_generator_close_race, _prime_code_cli_connection
+from .transport import _is_async_generator_close_race, _prime_code_cli_connection, _send_with_oauth_recovery
 from .types import AnthropicMessagesDeps
 
 
@@ -53,6 +60,7 @@ async def forward_anthropic_messages_as_chat_stream(
     line_count = 0
     data_line_count = 0
     finish_status = "unknown"
+    refusal_diagnostics = AnthropicRefusalDiagnostics()
     raw_sse_lines: list[str] = []
     raw_sse_size = 0
     raw_sse_truncated = False
@@ -89,6 +97,8 @@ async def forward_anthropic_messages_as_chat_stream(
     stream_idle_timeout_sec = max(0.1, float(deps.stream_idle_timeout_sec or 4.0))
     upstream_data_started = False
     last_upstream_data_time: float | None = None
+    ordinary_tool_seen = False
+    suppressed_terminal_blocks: set[int] = set()
 
     def emit_done() -> bytes:
         return b"data: [DONE]\n\n"
@@ -197,8 +207,9 @@ async def forward_anthropic_messages_as_chat_stream(
             )
             deps.log(f"{trace_prefix}claude_upstream_request_start elapsed={deps.fmt_ms(request_t0)}")
             upstream_t0 = time.perf_counter()
-            upstream_request = client.build_request("POST", url, json=request_data, headers=headers)
-            upstream_open_task = asyncio.create_task(client.send(upstream_request, stream=True))
+            upstream_open_task = asyncio.create_task(_send_with_oauth_recovery(
+                client=client, url=url, request_data=request_data, headers=headers,
+                deps=deps, trace_prefix=trace_prefix))
             response: httpx.Response | None = None
             try:
                 if header_keepalive_enabled:
@@ -224,8 +235,10 @@ async def forward_anthropic_messages_as_chat_stream(
                 else:
                     response = await upstream_open_task
 
+                deps = scope_stop_detection(deps, response, url, trace_prefix)
                 deps.log(
                     f"{trace_prefix}claude_upstream_headers status={response.status_code} "
+                    f"{format_account_pool_route(response)} "
                     f"elapsed={deps.fmt_ms(upstream_t0)}"
                 )
                 if response.status_code != 200:
@@ -253,7 +266,7 @@ async def forward_anthropic_messages_as_chat_stream(
                 line_queue = asyncio.Queue()
                 if cache_keepalive_enabled:
                     cache_keepalive_state = _ClaudeCacheKeepaliveLoopState()
-                    cache_keepalive_task = asyncio.create_task(
+                    cache_keepalive_task = spawn_detached(
                         _run_claude_cache_keepalive_loop(
                             url=url,
                             request_data=request_data,
@@ -352,6 +365,7 @@ async def forward_anthropic_messages_as_chat_stream(
                             stream_idle_timeout_enabled
                             and upstream_data_started
                             and last_upstream_data_time is not None
+                            and (visible_delta_count > 0 or ordinary_tool_seen)
                         ):
                             idle_remaining = stream_idle_timeout_sec - (
                                 time.perf_counter() - last_upstream_data_time
@@ -368,6 +382,7 @@ async def forward_anthropic_messages_as_chat_stream(
                                 stream_idle_timeout_enabled
                                 and upstream_data_started
                                 and last_upstream_data_time is not None
+                                and (visible_delta_count > 0 or ordinary_tool_seen)
                                 and now - last_upstream_data_time >= stream_idle_timeout_sec
                             )
                             if upstream_data_idle:
@@ -456,6 +471,8 @@ async def forward_anthropic_messages_as_chat_stream(
                         except json.JSONDecodeError:
                             continue
 
+                        refusal_diagnostics.observe(data)
+
                         if data.get("type") == "error":
                             err = data.get("error") or {}
                             err_msg = err.get("message") or json.dumps(data, ensure_ascii=False)
@@ -502,7 +519,99 @@ async def forward_anthropic_messages_as_chat_stream(
                                 sent_role_chunk = True
                             continue
 
+                        if event_type == "content_block_start":
+                            block = data.get("content_block")
+                            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                                continue
+                            block_index = int(data.get("index") or 0)
+                            tool_name = str(block.get("name") or "")
+                            if tool_name == TERMINAL_TOOL_NAME:
+                                suppressed_terminal_blocks.add(block_index)
+                                finish_status = "terminal_tool"
+                                deps.log(
+                                    f"{trace_prefix}terminal_tool protocol=anthropic "
+                                    f"after_ordinary={ordinary_tool_seen} index={block_index}"
+                                )
+                                deps.save_request_log(
+                                    model,
+                                    messages,
+                                    full_response or "[empty response]",
+                                    stream=True,
+                                    raw_sse="\n".join(raw_sse_lines + ["[TERMINAL_TOOL by proxy]"]),
+                                    request_payload=request_data,
+                                    trace_id=trace_id,
+                                )
+                                await close_upstream_for_early_stop(
+                                    response=response,
+                                    client=client,
+                                    reader_task=upstream_reader,
+                                    reason="terminal_tool",
+                                )
+                                stop_chunk = _build_openai_chunk(
+                                    stream_id=stream_id,
+                                    created=created,
+                                    model=model,
+                                    finish_reason="tool_calls" if ordinary_tool_seen else "stop",
+                                )
+                                yield f"data: {json.dumps(stop_chunk, ensure_ascii=True)}\n\n".encode()
+                                yield emit_done()
+                                return
+
+                            ordinary_tool_seen = True
+                            if not sent_role_chunk:
+                                role_chunk = _build_openai_chunk(
+                                    stream_id=stream_id,
+                                    created=created,
+                                    model=model,
+                                    role="assistant",
+                                )
+                                yield f"data: {json.dumps(role_chunk, ensure_ascii=True)}\n\n".encode()
+                                sent_role_chunk = True
+                            initial_input = block.get("input")
+                            initial_arguments = (
+                                json.dumps(initial_input, ensure_ascii=False, separators=(",", ":"))
+                                if isinstance(initial_input, dict) and initial_input
+                                else ""
+                            )
+                            tool_chunk = _build_openai_chunk(
+                                stream_id=stream_id,
+                                created=created,
+                                model=model,
+                            )
+                            tool_chunk["choices"][0]["delta"]["tool_calls"] = [{
+                                "index": block_index,
+                                "id": str(block.get("id") or f"toolu_{block_index}"),
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": initial_arguments,
+                                },
+                            }]
+                            yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n".encode()
+                            last_downstream_emit = time.perf_counter()
+                            continue
+
                         if event_type == "content_block_delta":
+                            block_index = int(data.get("index") or 0)
+                            raw_delta = data.get("delta")
+                            if isinstance(raw_delta, dict) and raw_delta.get("type") == "input_json_delta":
+                                if block_index in suppressed_terminal_blocks:
+                                    continue
+                                partial_json = raw_delta.get("partial_json")
+                                if isinstance(partial_json, str) and partial_json:
+                                    ordinary_tool_seen = True
+                                    tool_chunk = _build_openai_chunk(
+                                        stream_id=stream_id,
+                                        created=created,
+                                        model=model,
+                                    )
+                                    tool_chunk["choices"][0]["delta"]["tool_calls"] = [{
+                                        "index": block_index,
+                                        "function": {"arguments": partial_json},
+                                    }]
+                                    yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n".encode()
+                                    last_downstream_emit = time.perf_counter()
+                                continue
                             delta, delta_field = _extract_anthropic_sse_delta(data)
                             if not delta:
                                 continue
@@ -593,11 +702,22 @@ async def forward_anthropic_messages_as_chat_stream(
                             continue
 
                         if event_type == "message_stop":
+                            if deps.retire_refused_session(stop_reason, trace_prefix):
+                                _cancel_claude_cache_post_keepalive(
+                                    post_key=cache_post_keepalive_key,
+                                    deps=deps,
+                                    trace_prefix=trace_prefix,
+                                    reason="upstream_refusal",
+                                )
                             stop_chunk = _build_openai_chunk(
                                 stream_id=stream_id,
                                 created=created,
                                 model=model,
-                                finish_reason=_map_stop_reason(stop_reason),
+                                finish_reason=(
+                                    "tool_calls"
+                                    if ordinary_tool_seen
+                                    else _map_stop_reason(stop_reason)
+                                ),
                             )
                             deps.save_request_log(
                                 model,
@@ -757,11 +877,16 @@ async def forward_anthropic_messages_as_chat_stream(
                     pass
         if cache_keepalive_enabled and isinstance(cache_keepalive, dict) and finish_status not in {
             "early_stop_tag",
+            "terminal_tool",
             "downstream_cancelled",
             "anthropic_upstream_data_idle_timeout",
+            "message_stop:refusal",
         }:
-            post_state = _ClaudeCachePostKeepaliveState()
-            post_task = asyncio.create_task(
+            post_state = _ClaudeCachePostKeepaliveState(token=uuid.uuid4().hex)
+            shared = getattr(deps, 'shared_runtime_state', None)
+            if shared is not None:
+                shared.replace_token('claude-post:'+cache_post_keepalive_key, post_state.token)
+            post_task = spawn_detached(
                 _run_claude_cache_post_keepalive_after_delay(
                     post_key=cache_post_keepalive_key,
                     delay_sec=float(cache_keepalive.get("post_delay_sec") or cache_keepalive.get("interval_sec") or 240.0),
@@ -804,5 +929,5 @@ async def forward_anthropic_messages_as_chat_stream(
             f"out_chars={len(full_response)} visible_deltas={visible_delta_count} "
             f"reasoning_chars={reasoning_chars} ignored_delta_chars={ignored_delta_chars} "
             f"pings={ping_count} keepalives={keepalive_count} "
-            f"usage_total={usage.get('total_tokens', 0)}"
+            f"usage_total={usage.get('total_tokens', 0)}{refusal_diagnostics.log_suffix()}"
         )

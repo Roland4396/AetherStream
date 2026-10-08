@@ -1,3 +1,5 @@
+from filelock import FileLock
+
 import hashlib
 import json
 import logging
@@ -8,6 +10,9 @@ import time
 from datetime import datetime
 
 from fastapi import Request
+
+from aetherstream.features.replay import ReplayPreparationError, parse_replay_record
+from aetherstream.observability.refusals import AnthropicRefusalDiagnostics
 
 
 class SuccessfulHealthAccessFilter(logging.Filter):
@@ -27,8 +32,11 @@ class SuccessfulHealthAccessFilter(logging.Filter):
 
         successful = 200 <= status_code < 400
         routine_request = (
-            (method == 'GET' and path == '/health')
-            or (method == 'POST' and path == '/v1/chat/completions')
+            (method == 'GET' and path in {'/health', '/ready', '/admin/runtime', '/admin/quota-keeper'})
+            or (
+                method == 'POST'
+                and path in {'/v1/chat/completions', '/v1/responses', '/v1/messages'}
+            )
         )
         return not (successful and routine_request)
 
@@ -48,7 +56,7 @@ class ProxyLogger:
         self.verbose_trace = os.environ.get("STREAM_PROXY_VERBOSE_TRACE", "false").lower() == "true"
         os.makedirs(self.log_dir, exist_ok=True)
         self.counter_file = os.path.join(self.log_dir, "counter.txt")
-        self._write_lock = threading.RLock()
+        self._write_lock = FileLock(os.path.join(self.log_dir, '.request-log.lock'))
 
     def log(self, msg: str) -> None:
         if self.debug and self._should_emit(msg):
@@ -83,8 +91,17 @@ class ProxyLogger:
             "collect_done",
             "nonstream_dedupe",
             "nonstream_replay",
+            "nonstream_keepalive",
+            "claude_session_retire",
+            "claude_nonstream_to_stream ",
+            "glm52_official_thinking ",
             "return_shape",
             "saved log #",
+            "ai_stage_warning ",
+            "ai_scene_filter ",
+            "quota_keeper ",
+            "runtime_lifecycle ",
+            "early_stop_disclaimer_ignored ",
         )
         if any(token in lower for token in high_signal_tokens):
             return True
@@ -159,6 +176,9 @@ class ProxyLogger:
     ) -> None:
         log_id = self._get_next_log_id()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        reasoning_response = self._extract_reasoning_response(raw_sse, model)
+        refusal = AnthropicRefusalDiagnostics.from_raw(raw_sse)
+        refusal_info = refusal.metadata()
 
         input_payload = {
             "time": timestamp,
@@ -176,6 +196,8 @@ class ProxyLogger:
             input_payload["debug"] = debug_meta
         if error_type:
             input_payload["error_type"] = error_type
+        if refusal_info:
+            input_payload["upstream_refusal"] = refusal_info
 
         input_file = os.path.join(self.log_dir, f"{log_id:02d}_input.json")
         self._write_text_atomic(
@@ -193,11 +215,29 @@ class ProxyLogger:
             output_lines.append(f"TraceId: {trace_id}")
         if error_type:
             output_lines.append(f"ErrorType: {error_type}")
-        output_lines.extend([
-            f"Length: {len(response)}",
-            "=" * 50,
-            response,
-        ])
+        if refusal_info:
+            output_lines.extend([
+                f"UpstreamStopReason: {refusal_info['stop_reason']}",
+                f"RefusalCategory: {refusal_info['category']}",
+                f"RefusalExplanation: {refusal_info['explanation']}",
+                f"RefusalSource: {refusal_info['source']}",
+                'RefusalDetails: ' + json.dumps(refusal_info['stop_details'], ensure_ascii=False),
+            ])
+        output_lines.append(f"Length: {len(response)}")
+        if reasoning_response:
+            output_lines.extend([
+                f"ReasoningLength: {len(reasoning_response)}",
+                "=" * 50,
+                "--- reasoning_content ---",
+                reasoning_response,
+                "--- content ---",
+                response,
+            ])
+        else:
+            output_lines.extend([
+                "=" * 50,
+                response,
+            ])
         self._write_text_atomic(output_file, "\n".join(output_lines))
 
         raw_file = os.path.join(self.log_dir, f"{log_id:02d}_raw_sse.txt")
@@ -218,8 +258,19 @@ class ProxyLogger:
         self.log(
             f"Saved log #{log_id}{trace_part}: "
             f"input={len(json.dumps(input_size_obj, ensure_ascii=False))} bytes, "
-            f"output={len(response)} bytes, raw_sse={len(raw_sse)} bytes"
+            f"output={len(response)} bytes, reasoning={len(reasoning_response)} bytes, "
+            f"raw_sse={len(raw_sse)} bytes{refusal.log_suffix()}"
         )
+
+    @staticmethod
+    def _extract_reasoning_response(raw_sse: str, model: str) -> str:
+        if not raw_sse:
+            return ""
+        try:
+            record = parse_replay_record(raw_sse, fallback_model=model)
+        except (ReplayPreparationError, TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        return record.reasoning_content
 
     def _get_next_log_id(self) -> int:
         try:

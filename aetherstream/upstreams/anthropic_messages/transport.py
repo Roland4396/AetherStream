@@ -1,11 +1,47 @@
 import asyncio
 import os
 import time
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 import httpx
 
 from .types import AnthropicMessagesDeps
+
+
+async def _send_with_oauth_recovery(*, client, url, request_data, headers, deps, trace_prefix=''):
+    request = client.build_request('POST', url, json=request_data, headers=headers)
+    response = await client.send(request, stream=True)
+    if response.status_code != 401 or deps.recover_oauth is None:
+        return response
+    try:
+        recovered = await deps.recover_oauth(response, url, trace_prefix)
+    except BaseException:
+        await response.aclose()
+        raise
+    if not recovered:
+        return response
+    await response.aclose()
+    deps.log(f'{trace_prefix}claude_oauth_recovered retry=once')
+    # Rebuild from the same immutable caller payload/headers. This is exactly
+    # one replay of a rejected authentication request, never a partial stream.
+    request = client.build_request('POST', url, json=request_data, headers=headers)
+    return await client.send(request, stream=True)
+
+
+@asynccontextmanager
+async def _stream_with_oauth_recovery(*, client, url, request_data, headers, deps, trace_prefix=''):
+    if deps.recover_oauth is None:
+        async with client.stream('POST', url, json=request_data, headers=headers) as response:
+            yield response
+        return
+    response = await _send_with_oauth_recovery(
+        client=client, url=url, request_data=request_data, headers=headers,
+        deps=deps, trace_prefix=trace_prefix)
+    try:
+        yield response
+    finally:
+        await response.aclose()
 
 
 def _is_async_generator_close_race(exc: BaseException) -> bool:

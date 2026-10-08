@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import re
 from typing import Any
 
 from aetherstream.features.opus_notes import (
@@ -30,6 +31,12 @@ rinka: blowjob, cowgirl, dogeza, footjob, missionary, standing_sex, suspended
 sasha: blowjob, doggy, missionary, sit_blowjob, suspended
 shino: cowgirl, footjob, missionary
 </char_cg_assets>'''
+
+
+def is_kimi_model(model: Any) -> bool:
+    name = str(model or '').strip().lower().rsplit('/', 1)[-1]
+    name = re.sub(r'^\[[^\]]+\]\s*', '', name)
+    return name == 'kimi' or name.startswith(('kimi-', 'kimi_', 'kimi.'))
 
 
 def _coerce_runtime_bool(value: Any, default: bool) -> bool:

@@ -1,0 +1,21 @@
+title = "AetherStream narrowly reviewed non-secret fixtures"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "An environment-variable selector name, never a credential value"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['^CLAUDE2_API_KEY$']
+paths = ['(^|/)(aetherstream/api/app\.py|proxy\.py)$']
+
+[[rules.allowlists]]
+description = "Exact invented token in the refusal-redaction regression fixture"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['^abcdef123456$']
+paths = ['(^|/)tests/test_refusal_diagnostics\.py$']

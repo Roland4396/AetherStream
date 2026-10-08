@@ -15,9 +15,15 @@ from aetherstream.upstreams.anthropic_messages.types import AnthropicMessagesDep
 class _FakeResponse:
     status_code = 200
 
-    def __init__(self, pause_seconds: float, header_delay_seconds: float = 0.0):
+    def __init__(
+        self,
+        pause_seconds: float,
+        header_delay_seconds: float = 0.0,
+        thinking_before_pause: bool = False,
+    ):
         self.pause_seconds = pause_seconds
         self.header_delay_seconds = header_delay_seconds
+        self.thinking_before_pause = thinking_before_pause
         self.closed = False
 
     async def __aenter__(self):
@@ -36,7 +42,22 @@ class _FakeResponse:
         yield "event: message_start"
         yield 'data: {"type":"message_start","message":{"id":"msg_test","model":"claude-test"}}'
         yield ""
+        if self.thinking_before_pause:
+            yield "event: content_block_start"
+            yield 'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}'
+        else:
+            yield "event: content_block_start"
+            yield 'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
+            yield "event: content_block_delta"
+            yield 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"started"}}'
         await asyncio.sleep(self.pause_seconds)
+        if self.thinking_before_pause:
+            yield "event: content_block_stop"
+            yield 'data: {"type":"content_block_stop","index":0}'
+            yield "event: content_block_start"
+            yield 'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}'
+            yield "event: content_block_delta"
+            yield 'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"finished"}}'
         yield "event: message_delta"
         yield 'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}'
         yield "event: message_stop"
@@ -150,7 +171,7 @@ class AnthropicStreamIdleTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(header_keepalives), 2)
         self.assertTrue(any("reason=message_stop:end_turn" in line for line in logs))
 
-    async def test_closes_upstream_after_data_stream_stalls(self):
+    async def test_closes_upstream_after_visible_output_stalls(self):
         logs: list[str] = []
         saved: list[dict] = []
         response = _FakeResponse(pause_seconds=1.0)
@@ -167,6 +188,19 @@ class AnthropicStreamIdleTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body.endswith(b"data: [DONE]\n\n"))
         self.assertTrue(any("claude_upstream_data_idle_timeout" in line for line in logs))
         self.assertEqual(saved[-1]["error_type"], "claude_upstream_data_idle_timeout")
+
+    async def test_thinking_phase_is_not_subject_to_idle_timeout(self):
+        logs: list[str] = []
+        saved: list[dict] = []
+        response = _FakeResponse(pause_seconds=0.1, thinking_before_pause=True)
+        deps = _build_deps(enabled=True, seconds=0.05, logs=logs, saved=saved)
+
+        body, _client = await _collect_stream(response, deps)
+
+        self.assertNotIn(b"upstream_stream_idle_timeout", body)
+        self.assertIn(b"finished", body)
+        self.assertTrue(body.endswith(b"data: [DONE]\n\n"))
+        self.assertTrue(any("reason=message_stop:end_turn" in line for line in logs))
 
     async def test_disabled_switch_allows_same_pause_to_finish(self):
         logs: list[str] = []

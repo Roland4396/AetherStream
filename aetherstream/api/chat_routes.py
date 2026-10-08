@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -11,19 +12,105 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from aetherstream.api.dependencies import RouteDependencies, build_route_dependencies
+from aetherstream.api.timed_routes import register_routes as register_timed_routes
+from aetherstream.features.kimi_sampling import apply_kimi_sampling_compat
 from aetherstream.features.replay import ReplayPreparationError
+from aetherstream.features.scene_filter import remove_scene_messages
+from aetherstream.features.stage_warning import wrap_stage_messages
 from aetherstream.features.request_injections import (
     append_assistant_prefill_continuation,
     apply_direct_opus_note,
     apply_forced_opus_note,
     apply_pioneer_opus_note,
+    is_kimi_model,
+)
+from aetherstream.features.terminal_tool import (
+    inject_openai_chat_terminal_tool,
+    prepend_anthropic_terminal_prompt,
+    terminal_tool_enabled_for_model,
 )
 from aetherstream.streaming.json_keepalive import keepalive_json_response
 from aetherstream.streaming.responses import DisconnectSafeStreamingResponse as StreamingResponse
+from aetherstream.utils.coerce import coerce_bool
+
+
+LATEST_WINS_LOCAL_MODELS = frozenset({
+    'glm-5.2-local',
+    'deepseek-v4-flash-local',
+})
 
 
 def _is_pioneer_auto_model(model: Any) -> bool:
     return str(model or '').strip().lower() in {'pioneer/auto', 'anthropic/pioneer-auto'}
+
+
+def _claude_nonstream_to_stream_enabled(deps: RouteDependencies) -> bool:
+    return coerce_bool(deps._runtime_lookup('claude', 'stream', 'nonstream_to_stream'), True)
+
+
+async def _run_claude_nonstream_once(
+    *, deps: RouteDependencies, protocol: str, model: str, url: str,
+    headers: dict, request_data: dict, trace_id: str, runner,
+) -> dict:
+    # Share Gemini's detached, cross-release exact-request barrier. Include
+    # endpoint/auth identity so identical bodies on different routes never mix.
+    # Managed session IDs remain part of the key: a new turn after refusal must
+    # not hit a response cached under the retired session.
+    key = deps.build_exact_request_key({
+        'scope': f'claude-nonstream:{protocol}',
+        'url': url,
+        'headers': headers,
+        'request': request_data,
+    })
+    result, shared = await deps.run_exact_nonstream_once(
+        dedupe_key=key, trace_id=trace_id,
+        upstream_label=f'claude:{protocol}:{model}', runner=runner,
+    )
+    if shared:
+        deps.log(f'[TRACE {trace_id}] nonstream_dedupe_return_shared model={model} key={key[:16]}')
+    return result
+
+
+async def _plain_claude_when_conversion_disabled(
+    *, deps: RouteDependencies, model: str, request_data: dict, url: str,
+    headers: dict, trace_id: str,
+) -> JSONResponse | None:
+    # Called only from existing non-stream request branches. Include channel
+    # aliases such as [m3]claude-* and 「anti5」claude-* without changing
+    # model routing/classification. Channel delimiters are not ASCII-only.
+    if not (deps.model_policy.is_claude_model(model)
+            or re.search(r'(?:^|[^\w])claude-', str(model).lower())):
+        return None
+    enabled = _claude_nonstream_to_stream_enabled(deps)
+    deps.log(
+        f"[TRACE {trace_id}] claude_nonstream_to_stream enabled={str(enabled).lower()} "
+        f"incoming_stream=false upstream_stream={str(enabled).lower()} model={model}"
+    )
+    if enabled:
+        return None  # Preserve the original streaming collector verbatim.
+    payload = dict(request_data, stream=False)
+
+    async def collect():
+        content, _, _, _, raw, response = await deps.collect_chat_completions_nonstream(
+            url=url, request_data=payload, headers=headers, timeout=deps.get_timeout_config(),
+            deps=deps.build_chat_completions_upstream_deps(), trace_id=trace_id,
+        )
+        if not isinstance(response, dict) or isinstance(response.get('error'), dict):
+            raise RuntimeError(f'Claude upstream non-stream error: {raw[:4000]}')
+        if not isinstance(response.get('choices'), list) or not response['choices']:
+            raise RuntimeError('Claude upstream non-stream response has no choices')
+        return {'content': content, 'raw': raw, 'response': response}
+
+    collected = await _run_claude_nonstream_once(
+        deps=deps, protocol='chat', model=model, url=url, headers=headers,
+        request_data=payload, trace_id=trace_id, runner=collect,
+    )
+    content, raw, response = collected['content'], collected['raw'], collected['response']
+    deps.save_request_log(
+        model, request_data.get('messages', []), content, stream=False,
+        raw_sse=raw, request_payload=payload, trace_id=trace_id,
+    )
+    return JSONResponse(response)
 
 
 def _drop_configured_request_fields(payload: dict[str, Any], route: dict[str, Any]) -> list[str]:
@@ -40,22 +127,53 @@ def _drop_configured_request_fields(payload: dict[str, Any], route: dict[str, An
     return removed
 
 
-def _apply_configured_template_thinking(payload: dict[str, Any], route: dict[str, Any]) -> bool:
-    enabled = route.get('enable_thinking')
-    if not isinstance(enabled, bool):
-        return False
+def _apply_configured_reasoning(payload: dict[str, Any], route: dict[str, Any]) -> list[str]:
+    changed: list[str] = []
 
+    effort = route.get('effort')
+    if isinstance(effort, str) and effort:
+        if payload.get('effort') != effort:
+            payload['effort'] = effort
+            changed.append('effort')
+
+    reasoning_effort = route.get('reasoning_effort')
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        if payload.get('reasoning_effort') != reasoning_effort:
+            payload['reasoning_effort'] = reasoning_effort
+            changed.append('reasoning_effort')
+
+    enabled = route.get('enable_thinking')
     kwargs = payload.get('chat_template_kwargs')
     if not isinstance(kwargs, dict):
         kwargs = {}
-    if kwargs.get('enable_thinking') is enabled:
-        payload['chat_template_kwargs'] = kwargs
-        return False
-
     kwargs = dict(kwargs)
-    kwargs['enable_thinking'] = enabled
-    payload['chat_template_kwargs'] = kwargs
-    return True
+    if isinstance(enabled, bool) and kwargs.get('enable_thinking') is not enabled:
+        kwargs['enable_thinking'] = enabled
+        changed.append('chat_template_kwargs.enable_thinking')
+
+    thinking = route.get('thinking')
+    if isinstance(thinking, bool) and kwargs.get('thinking') is not thinking:
+        kwargs['thinking'] = thinking
+        changed.append('chat_template_kwargs.thinking')
+
+    if isinstance(enabled, bool) or isinstance(thinking, bool):
+        payload['chat_template_kwargs'] = kwargs
+    return changed
+
+
+def _upstream_http_status(error: BaseException, default: int = 502) -> int:
+    """Recover an upstream HTTP status embedded by the OpenAI collector."""
+    match = re.search(r"\bUpstream error:\s*(\d{3})\b", str(error))
+    if match:
+        status = int(match.group(1))
+        if 400 <= status <= 599:
+            return status
+    return default
+
+
+def _apply_configured_template_thinking(payload: dict[str, Any], route: dict[str, Any]) -> bool:
+    """Compatibility wrapper for callers that only configure enable_thinking."""
+    return bool(_apply_configured_reasoning(payload, route))
 
 
 async def chat_completions(request: Request, deps: RouteDependencies):
@@ -66,6 +184,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
     trace_prefix = f"[TRACE {trace_id}]"
     route_t0 = time.perf_counter()
     caller_key, caller_desc = deps.build_caller_fingerprint(request)
+    local_supersede_event = None
     try:
         json_t0 = time.perf_counter()
         data = await request.json()
@@ -78,6 +197,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
         )
         model = data.get('model', '')
         stream = data.get('stream', False)
+        terminal_tool_enabled = terminal_tool_enabled_for_model(model)
+        injected = inject_openai_chat_terminal_tool(data) if terminal_tool_enabled else False
+        deps.log(
+            f"{trace_prefix} terminal_tool_injection protocol=openai_chat "
+            f"action={'added' if injected else ('present' if terminal_tool_enabled else 'skipped_model')}"
+        )
         removed_fields = deps.model_policy.apply_claude_sampling_compat(data)
         msg_count = len(data.get('messages', []))
         payload_sig = (
@@ -110,12 +235,21 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     f"prev_model={prev.get('model')} prev_msgs={prev.get('msg_count')} "
                     f"note=new stream from same caller may cancel previous stream"
                 )
+            supersede_previous = bool(
+                model in LATEST_WINS_LOCAL_MODELS
+            )
             deps.active_stream_registry.register(
                 caller_key,
                 trace_id=trace_id,
                 model=model,
                 msg_count=msg_count,
+                supersede_previous=supersede_previous,
             )
+            if model in LATEST_WINS_LOCAL_MODELS:
+                local_supersede_event = deps.active_stream_registry.cancellation_event(
+                    caller_key,
+                    trace_id,
+                )
 
         replay_model = str(inbound_request.get('model') or model)
         replay_messages = inbound_request.get('messages')
@@ -172,6 +306,20 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 )
             )
 
+        scene_removed, scene_invalid = remove_scene_messages(data.get('messages'))
+        if scene_removed or scene_invalid:
+            deps.log(
+                f"{trace_prefix} ai_scene_filter removed={scene_removed} "
+                f"invalid_skipped={scene_invalid}"
+            )
+
+        stage_wrapped, stage_invalid = wrap_stage_messages(data.get('messages'))
+        if stage_wrapped or stage_invalid:
+            deps.log(
+                f"{trace_prefix} ai_stage_warning wrapped={stage_wrapped} "
+                f"invalid_skipped={stage_invalid}"
+            )
+
         if str(model).startswith("fake-slow-stream"):
             fake_chunks = int(data.get('fake_chunks') or 1200)
             fake_delay = float(data.get('fake_delay') or 0.5)
@@ -219,6 +367,33 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 status_code=400
             )
 
+        if deps.is_claude_opus55_model(model):
+            # Apply before provider selection so aliases and all public
+            # protocols get the same approved note. Shared markers dedupe
+            # any existing route-specific Opus injection later in the path.
+            apply_forced_opus_note(
+                data,
+                selected_model=model,
+                trace_prefix=trace_prefix,
+                route_label="opus55",
+                log=deps.log,
+            )
+
+        if is_kimi_model(model):
+            data = copy.deepcopy(data)
+            removed = apply_kimi_sampling_compat(data, model)
+            deps.log(
+                f"{trace_prefix} kimi_compat model={model} "
+                f"sampling_removed={','.join(removed) or '-'} early_stop=runtime_config"
+            )
+            apply_forced_opus_note(
+                data,
+                selected_model=model,
+                trace_prefix=trace_prefix,
+                route_label="kimi",
+                log=deps.log,
+            )
+
         is_free_model, free_real_model = deps.parse_free_provider_prefix(model)
         # Free-pool Claude models require the Anthropic Messages API. Leave
         # those for the Claude shim below; this branch is OpenAI-compatible.
@@ -249,6 +424,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 deps.log(
                     f"{trace_prefix} free_openai_disable_template_thinking "
                     f"model={model} real_model={free_real_model}"
+                )
+            if deps.is_claude_opus55_model(free_real_model):
+                outbound_data, compat_meta = deps.apply_claude_model_compat_request(outbound_data)
+                deps.log(
+                    f"{trace_prefix} opus55_adaptive_compat route=free_openai "
+                    f"model={model} removed={compat_meta.get('removed', '-')}"
                 )
             append_assistant_prefill_continuation(
                 outbound_data,
@@ -305,7 +486,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
                         deps=deps.build_chat_completions_upstream_deps(),
-                        enable_early_stop=False,
+                        enable_early_stop=is_kimi_model(model),
                         model=model,
                         messages=data.get('messages', []),
                         trace_id=trace_id,
@@ -316,6 +497,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 )
 
             try:
+                plain_response = await _plain_claude_when_conversion_disabled(
+                    deps=deps, model=free_real_model, request_data=outbound_data,
+                    url=target_url, headers=headers, trace_id=trace_id,
+                )
+                if plain_response is not None:
+                    return plain_response
                 if free_is_gemini:
                     outbound_data['stream'] = False
                     dedupe_key = deps.build_exact_request_key(outbound_data)
@@ -363,7 +550,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     timeout=deps.get_timeout_config(),
                     max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
                     deps=deps.build_chat_completions_upstream_deps(),
-                    enable_early_stop=False,
+                    enable_early_stop=is_kimi_model(model),
                     trace_id=trace_id,
                 )
                 deps.save_request_log(
@@ -438,13 +625,18 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     is_opus_model=deps.is_claude_opus_model,
                     log=deps.log,
                 )
-            thinking_override = directory_route.get('enable_thinking')
-            if isinstance(thinking_override, bool):
-                changed = _apply_configured_template_thinking(outbound_data, directory_route)
+            has_reasoning_override = (
+                bool(str(directory_route.get('effort') or '').strip())
+                or bool(str(directory_route.get('reasoning_effort') or '').strip())
+                or isinstance(directory_route.get('enable_thinking'), bool)
+                or isinstance(directory_route.get('thinking'), bool)
+            )
+            if has_reasoning_override:
+                changed = _apply_configured_reasoning(outbound_data, directory_route)
                 deps.log(
-                    f"{trace_prefix} model-directory_template_thinking "
-                    f"name={route_name} model={model} enabled={str(thinking_override).lower()} "
-                    f"changed={str(changed).lower()}"
+                    f"{trace_prefix} model-directory_reasoning_override "
+                    f"name={route_name} model={model} "
+                    f"changed={','.join(changed) or '-'}"
                 )
             elif deps.apply_openai_template_thinking_disabled(outbound_data, model):
                 deps.log(
@@ -488,7 +680,10 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         f"blocks={filter_stats['blocks']} chars={filter_stats['chars']} "
                         f"mode=closed_tags_and_bare_image_prompts"
                     )
-            no_reasoning_meta = deps.apply_pro_no_reasoning_payload(outbound_data, route_name, base_url)
+            # Opus 5.5 rejects disabled thinking. Do not let the general pro
+            # latency policy erase its adaptive/effort settings.
+            opus55 = deps.is_claude_opus55_model(model)
+            no_reasoning_meta = {} if opus55 else deps.apply_pro_no_reasoning_payload(outbound_data, route_name, base_url)
             if no_reasoning_meta:
                 deps.log(
                     f"{trace_prefix} pro_no_reasoning_payload "
@@ -496,7 +691,22 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     f"reasoning_effort={no_reasoning_meta.get('reasoning_effort')} "
                     f"removed={','.join(no_reasoning_meta.get('removed') or []) or '-'}"
                 )
-            if directory_is_pioneer_upstream or deps.model_policy.is_claude_model(model):
+            if opus55:
+                outbound_data, compat_meta = deps.apply_claude_model_compat_request(outbound_data)
+                deps.log(
+                    f"{trace_prefix} opus55_adaptive_compat route=model_directory "
+                    f"name={route_name} model={model} removed={compat_meta.get('removed', '-')}"
+                )
+            # Some Claude-compatible model ids are provider aliases (for
+            # example ``agy-claude-opus-4-6``) and cannot be classified from
+            # the model string alone.  An explicit route compatibility flag
+            # is authoritative for those aliases.
+            route_requires_user_ended_prefill = (
+                directory_is_pioneer_upstream
+                or deps.model_policy.is_claude_model(model)
+                or bool(directory_route.get('inject_opus_note'))
+            )
+            if route_requires_user_ended_prefill:
                 append_assistant_prefill_continuation(
                     outbound_data,
                     selected_model=model,
@@ -553,17 +763,24 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
                         deps=deps.build_chat_completions_upstream_deps(),
-                        enable_early_stop=False,
+                        enable_early_stop=is_kimi_model(model),
                         model=model,
                         messages=data.get('messages', []),
                         trace_id=trace_id,
                         caller_key=caller_key,
                         caller_desc=caller_desc,
+                        supersede_event=local_supersede_event,
                     ),
                     media_type='text/event-stream'
                 )
 
             try:
+                plain_response = await _plain_claude_when_conversion_disabled(
+                    deps=deps, model=model, request_data=outbound_data,
+                    url=target_url, headers=headers, trace_id=trace_id,
+                )
+                if plain_response is not None:
+                    return plain_response
                 use_plain_non_stream = bool(deps.model_policy.is_gemini_model(model))
                 upstream_nonstream_payload = None
                 if use_plain_non_stream:
@@ -608,6 +825,9 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                             f"key={dedupe_key[:16]} out_chars={len(full_content)}"
                         )
                 else:
+                    # The collector sends stream=True on its own copy. Keep
+                    # the saved upstream payload truthful as well.
+                    outbound_data['stream'] = True
                     full_content, model_name, usage, finish_reason, raw_response = await deps.collect_chat_completions_stream(
                         url=target_url,
                         request_data=outbound_data,
@@ -615,7 +835,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
                         deps=deps.build_chat_completions_upstream_deps(),
-                        enable_early_stop=False,
+                        enable_early_stop=is_kimi_model(model),
                         trace_id=trace_id,
                     )
                 deps.save_request_log(
@@ -668,7 +888,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 )
                 return JSONResponse(
                     {"error": {"message": str(e), "type": "model_directory_upstream_error"}},
-                    status_code=502
+                    status_code=_upstream_http_status(e),
                 )
 
         # Gemini 模型：直接 HTTP 直连（不再依赖 gemini-proxy）
@@ -697,8 +917,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
             gemini_config = deps.build_gemini_generate_content_config()
             gemini_deps = deps.build_gemini_generate_content_deps()
 
+            deps.log(
+                f"{trace_prefix} native_gemini stream_to_nonstream "
+                f"model={model} downstream_stream={str(bool(stream)).lower()} "
+                f"upstream_method=generateContent upstream_stream=false"
+            )
             if stream:
-                data['stream'] = True
+                data['stream'] = False
                 return StreamingResponse(
                     deps.forward_gemini_generate_content_stream(
                         model=model,
@@ -856,6 +1081,8 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 prompt_cache_control=prompt_cache_control if prompt_cache_enabled_for_model and prompt_cache_cfg.get('mode') == 'explicit' else None,
                 prompt_cache_strategy=prompt_cache_strategy,
             )
+            if terminal_tool_enabled:
+                prepend_anthropic_terminal_prompt(claude_request)
             if prompt_cache_enabled_for_model and prompt_cache_cfg.get('mode') == 'automatic' and isinstance(prompt_cache_control, dict):
                 claude_request['cache_control'] = dict(prompt_cache_control)
             claude_request = deps.apply_claude_output_settings(claude_request)
@@ -922,6 +1149,9 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                             f"blocks={system_fold_meta.get('blocks')} "
                             f"chars={system_fold_meta.get('chars')}"
                         )
+                claude_deps = deps.build_anthropic_messages_deps(claude_request)
+                claude_deps.session_key = claude_session_key
+                claude_deps.session_id = claude_session_id
                 return StreamingResponse(
                     deps.forward_anthropic_messages_as_chat_stream(
                         url=claude_url,
@@ -934,7 +1164,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         caller_desc=caller_desc,
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                        deps=deps.build_anthropic_messages_deps(),
+                        deps=claude_deps,
                         cache_keepalive=prompt_cache_keepalive_cfg if prompt_cache_keepalive_enabled_for_model else None,
                     ),
                     media_type='text/event-stream'
@@ -942,7 +1172,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
 
             try:
                 claude_request = dict(claude_request)
-                claude_request['stream'] = True
+                claude_request['stream'] = _claude_nonstream_to_stream_enabled(deps)
+                deps.log(
+                    f"{trace_prefix} claude_nonstream_to_stream "
+                    f"enabled={str(claude_request['stream']).lower()} incoming_stream=false "
+                    f"upstream_stream={str(claude_request['stream']).lower()} model={model}"
+                )
                 if deps.is_claude_haiku_model(model):
                     claude_request, system_fold_meta = deps.fold_claude_system_into_first_user_message(claude_request)
                     if system_fold_meta.get('action') != 'absent':
@@ -952,17 +1187,31 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                             f"blocks={system_fold_meta.get('blocks')} "
                             f"chars={system_fold_meta.get('chars')}"
                         )
-                full_content, model_name, usage, finish_reason, raw_response = await deps.collect_anthropic_messages_as_chat_completion(
-                    url=claude_url,
-                    request_data=claude_request,
-                    headers=claude_headers,
-                    model=model,
-                    messages=data.get('messages', []),
-                    trace_id=trace_id,
-                    timeout=deps.get_timeout_config(),
-                    max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                    deps=deps.build_anthropic_messages_deps(),
+                claude_deps = deps.build_anthropic_messages_deps(claude_request)
+                claude_deps.session_key = claude_session_key
+                claude_deps.session_id = claude_session_id
+
+                async def collect_claude():
+                    collected = await deps.collect_anthropic_messages_as_chat_completion(
+                        url=claude_url,
+                        request_data=claude_request,
+                        headers=claude_headers,
+                        model=model,
+                        messages=data.get('messages', []),
+                        trace_id=trace_id,
+                        timeout=deps.get_timeout_config(),
+                        max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
+                        deps=claude_deps,
+                        upstream_stream=claude_request['stream'],
+                    )
+                    return {'collected': collected}
+
+                collected_result = await _run_claude_nonstream_once(
+                    deps=deps, protocol='messages', model=model, url=claude_url,
+                    headers=claude_headers, request_data=claude_request,
+                    trace_id=trace_id, runner=collect_claude,
                 )
+                full_content, model_name, usage, finish_reason, raw_response, tool_calls = collected_result['collected']
                 deps.save_request_log(
                     model,
                     data.get('messages', []),
@@ -976,6 +1225,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     },
                     trace_id=trace_id,
                 )
+                response_message = {
+                    "role": "assistant",
+                    "content": full_content,
+                }
+                if tool_calls:
+                    response_message["tool_calls"] = tool_calls
                 return JSONResponse({
                     "id": f"chatcmpl-{uuid.uuid4()}",
                     "object": "chat.completion",
@@ -983,10 +1238,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     "model": model_name or model,
                     "choices": [{
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": full_content
-                        },
+                        "message": response_message,
                         "finish_reason": finish_reason
                     }],
                     "usage": usage or {
@@ -1021,6 +1273,15 @@ async def chat_completions(request: Request, deps: RouteDependencies):
         if deps.model_policy.is_gpt_model(model):
             outbound_data = deps.inject_gpt_usage_policies_system_message(data)
             deps.log(f"{trace_prefix} gpt_usage_policies_system_injected first_system=yes")
+            # Apply the existing shared notes before Chat -> Responses conversion,
+            # so both public entrypoints and both response modes retain them.
+            apply_forced_opus_note(
+                outbound_data,
+                selected_model=model,
+                trace_prefix=trace_prefix,
+                route_label='gpt',
+                log=deps.log,
+            )
             if not deps.RESPONSES_API_KEY:
                 if stream:
                     deps.release_active_stream_caller(caller_key, trace_id)
@@ -1149,7 +1410,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
                         deps=deps.build_chat_completions_upstream_deps(),
-                        enable_early_stop=False,
+                        enable_early_stop=is_kimi_model(model),
                         model=model,
                         messages=data.get('messages', []),
                         trace_id=trace_id,
@@ -1160,6 +1421,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                 )
 
             try:
+                outbound_data['stream'] = True
                 full_content, model_name, usage, finish_reason, raw_sse = await deps.collect_chat_completions_stream(
                     url=deps.GPT_BASE_URL,
                     request_data=outbound_data,
@@ -1167,7 +1429,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     timeout=deps.get_timeout_config(),
                     max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
                     deps=deps.build_chat_completions_upstream_deps(),
-                    enable_early_stop=False,
+                    enable_early_stop=is_kimi_model(model),
                     trace_id=trace_id,
                 )
 
@@ -1304,6 +1566,12 @@ async def chat_completions(request: Request, deps: RouteDependencies):
             base_url = str(passthrough_upstream.get('base_url') or '').rstrip('/')
             target_url = f"{base_url}/chat/completions"
             outbound_data = copy.deepcopy(data)
+            if deps.is_claude_opus55_model(model):
+                outbound_data, compat_meta = deps.apply_claude_model_compat_request(outbound_data)
+                deps.log(
+                    f"{trace_prefix} opus55_adaptive_compat route=model_name_passthrough "
+                    f"name={route_name} model={model} removed={compat_meta.get('removed', '-')}"
+                )
             if deps.should_apply_deepseek_drawing_context_filter(route_name, base_url):
                 filter_stats = deps.apply_drawing_context_filter(outbound_data)
                 if filter_stats.get('blocks'):
@@ -1336,7 +1604,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                         timeout=deps.get_timeout_config(),
                         max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
                         deps=deps.build_chat_completions_upstream_deps(),
-                        enable_early_stop=False,
+                        enable_early_stop=is_kimi_model(model),
                         model=model,
                         messages=data.get('messages', []),
                         trace_id=trace_id,
@@ -1346,6 +1614,13 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     media_type='text/event-stream'
                 )
             try:
+                plain_response = await _plain_claude_when_conversion_disabled(
+                    deps=deps, model=model, request_data=outbound_data,
+                    url=target_url, headers=headers, trace_id=trace_id,
+                )
+                if plain_response is not None:
+                    return plain_response
+                outbound_data['stream'] = True
                 full_content, model_name, usage, finish_reason, raw_sse = await deps.collect_chat_completions_stream(
                     url=target_url,
                     request_data=outbound_data,
@@ -1353,7 +1628,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
                     timeout=deps.get_timeout_config(),
                     max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
                     deps=deps.build_chat_completions_upstream_deps(),
-                    enable_early_stop=False,
+                    enable_early_stop=is_kimi_model(model),
                     trace_id=trace_id,
                 )
                 deps.save_request_log(
@@ -1508,6 +1783,7 @@ CHAT_DEPENDENCY_NAMES = (
     'get_timeout_config',
     'inject_gpt_usage_policies_system_message',
     'is_claude_haiku_model',
+    'is_claude_opus55_model',
     'is_claude_opus_model',
     'is_claude_prompt_cache_model',
     'is_claude_sonnet_model',
@@ -1553,4 +1829,5 @@ def register_routes(app, ctx: dict[str, Any]) -> RouteDependencies:
         )
 
     app.post('/v1/chat/completions')(chat_completions_endpoint)
+    register_timed_routes(app, handler=chat_completions, deps=deps)
     return deps

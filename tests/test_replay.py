@@ -170,6 +170,22 @@ class ReplayStoreTests(unittest.TestCase):
         self.assertTrue(entries[0]["replay_usable"])
         self.assertTrue(entries[0]["replay_source_complete"])
 
+    def test_output_snapshot_reader_excludes_logged_reasoning(self):
+        output_path = self.log_dir / "reasoning_output.txt"
+        output_path.write_text(
+            "Time: 20260820_121926\n"
+            "Model: transsion/kimi-k3\n"
+            "Stream: True\n"
+            "Length: 6\n"
+            "ReasoningLength: 12\n"
+            + "=" * 50
+            + "\n--- reasoning_content ---\nfirst second\n"
+            "--- content ---\nanswer",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.store._read_output_text(str(output_path)), "answer")
+
     def test_once_does_not_consume_a_newer_selection(self):
         (self.log_dir / "02_raw_sse.txt").write_text(
             _envelope(_openai_chunk("new") + _openai_chunk(finish_reason="stop")),

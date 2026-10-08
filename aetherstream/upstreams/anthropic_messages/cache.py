@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,7 @@ class _ClaudeCacheKeepaliveLoopState:
 
 @dataclass
 class _ClaudeCachePostKeepaliveState:
+    token: str = ""
     task: asyncio.Task | None = None
     started: bool = False
     in_flight: bool = False
@@ -194,6 +196,9 @@ def _cancel_claude_cache_post_keepalive(
     trace_prefix: str,
     reason: str,
 ) -> None:
+    shared = getattr(deps, 'shared_runtime_state', None)
+    if shared is not None:
+        shared.replace_token('claude-post:'+post_key, uuid.uuid4().hex)
     state = _CLAUDE_CACHE_POST_KEEPALIVE_TASKS.get(post_key)
     task = state.task if isinstance(state, _ClaudeCachePostKeepaliveState) else None
     if task is None or task.done():
@@ -449,12 +454,25 @@ async def _run_claude_cache_post_keepalive_after_delay(
         f"key={post_key} fingerprint={fingerprint} delay={delay:.1f}s "
         f"max_runs={run_limit}"
     )
+    shared = getattr(deps, 'shared_runtime_state', None)
+    def still_current():
+        return shared is None or shared.current_token('claude-post:'+post_key) == post_state.token
+    async def delay_if_current():
+        # A new request on the other release cancels only pending work, never an
+        # already-open upstream call. Avoid keeping an obsolete delay alive.
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            if not still_current():
+                return False
+            await asyncio.sleep(min(1.0, max(0.0, deadline-time.monotonic())))
+        return still_current()
     try:
-        await asyncio.sleep(delay)
+        if not await delay_if_current():
+            return
         post_state.started = True
         run_index = 0
         while run_index < run_limit:
-            if _CLAUDE_CACHE_POST_KEEPALIVE_TASKS.get(post_key) is not post_state:
+            if not still_current() or _CLAUDE_CACHE_POST_KEEPALIVE_TASKS.get(post_key) is not post_state:
                 deps.log(
                     f"{trace_prefix}claude_cache_keepalive_post_skip "
                     f"key={post_key} reason=replaced runs={run_index}"
@@ -485,7 +503,8 @@ async def _run_claude_cache_post_keepalive_after_delay(
             )
             if post_state.stop_requested or run_index >= run_limit:
                 break
-            await asyncio.sleep(delay)
+            if not await delay_if_current():
+                break
         deps.log(
             f"{trace_prefix}claude_cache_keepalive_post_completed "
             f"key={post_key} fingerprint={fingerprint} runs={run_index} "
@@ -498,5 +517,7 @@ async def _run_claude_cache_post_keepalive_after_delay(
         )
         raise
     finally:
+        if shared is not None:
+            shared.release_token('claude-post:'+post_key, post_state.token)
         if _CLAUDE_CACHE_POST_KEEPALIVE_TASKS.get(post_key) is post_state:
             _CLAUDE_CACHE_POST_KEEPALIVE_TASKS.pop(post_key, None)

@@ -1,0 +1,20 @@
+# Stream release contract
+
+## Non-negotiable: future features preserve live requests
+
+Application updates build an immutable image, then explicitly invoke `python3 stream-proxy/tools/release.py deploy --image <immutable-tag>` from the parent deployment repository. This is a command-line tool, not a resident code watcher: it starts the inactive slot, checks readiness/compatibility, switches new requests and hands off background jobs while existing requests finish on their original instance. The user need not stop using Tavern. Never upgrade an active container in place, restart the stable Nginx entry `stream-proxy`, or run a blanket Compose rebuild; `stream-blue` and `stream-green` are the application slots.
+
+- All HTTP and WebSocket routes, including new routes, must stay behind the outermost `LifecycleMiddleware` until their final cleanup. Headers or `[DONE]` are not a lifecycle boundary.
+- Request-owned work that outlives the HTTP connection must use `runtime.tasks.spawn_detached` (or an explicitly tested drain barrier). No untracked `create_task`, executor, thread, subprocess, or timer. `TASK_CONTRACTS` and its AST test require review for every new raw async task.
+- Periodic/global features implement `start`, `stop`, `status`, register through `RuntimeLifecycle`, and are declared in `FEATURE_CONTRACTS`. Do not start them on import, health/readiness, or independently in each worker. `stop` must finish an in-flight paid request before returning. The kernel-backed shared lease remains held until all old jobs stop.
+- Cross-request state that affects semantics belongs in a process-safe shared store, not module globals. Use DiskCache transactions for small shared state and FileLock for whole-operation exclusivity. Preserve quota schedules, pauses/guards, replay-once claims, log triples, caller/session identity, latest-wins cancellation and exact-request dedupe across releases. Never use expiring lock TTLs to authorize duplicate paid work.
+- `/ready` is side-effect-free with respect to GPU, providers and jobs. New versions must pass readiness plus bidirectional API/state compatibility before routing changes. State migration uses backward-compatible expand/contract; do not silently bump schema and delete old state to make rollout pass.
+- The release tool automatically stops the old instance only after HTTP/WS counts, detached work, background ownership, old Nginx workers and upstream connections are all clear. Its default `--wait 1800` is a configurable 30-minute drain wait per invocation, not a generation/request timeout. Expiry returns exit code `2`, retains old requests and the old container, and leaves the new version serving; never follow it with force-remove or kill. Once the CLI exits, it does not keep polling or stop the old container later by itself.
+- Inference POSTs are not automatically replayed by the stable proxy. Do not add proxy retries to conceal deployment errors.
+- Rollback preserves existing streams in both directions; a pending drain does not authorize killing a slot to reuse it. After a timeout, inspect `python3 stream-proxy/tools/release.py status` and explicitly run `python3 stream-proxy/tools/release.py drain --wait 1800` from the parent repository; use `recover` after an interrupted release. Report “new version serving, old instance still draining” until cleanup succeeds, rather than claiming retirement is complete.
+
+## Acceptance
+
+Run the complete offline suite, including lifecycle/task-scope, cross-process shared-state and compatibility tests. For release/runtime changes, additionally run real Nginx SSE + WebSocket promotion and rollback probes, including a drain timeout and old-connection continuity. The admin diagnostic endpoints use a separate private token and never call a model. Tests must not initialize GPU workers or use paid inference.
+
+This is a single-host planned-application-upgrade guarantee, not a promise against machine/power failure. Multi-host scheduling requires a separately designed fenced distributed lease/store. Stable ingress/kernel upgrades are infrastructure maintenance and must not be presented as ordinary zero-loss feature deployments.

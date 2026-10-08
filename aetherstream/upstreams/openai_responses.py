@@ -7,6 +7,9 @@ from typing import Any, AsyncGenerator, Callable
 
 import httpx
 
+from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME
+from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection
+
 
 @dataclass
 class ResponsesUpstreamDeps:
@@ -56,6 +59,34 @@ def _build_openai_chunk(
     }
 
 
+def _build_openai_tool_chunk(
+    *,
+    stream_id: str,
+    created: int,
+    model: str,
+    index: int,
+    call_id: str = "",
+    name: str = "",
+    arguments: str = "",
+) -> dict[str, Any]:
+    function: dict[str, Any] = {}
+    if name:
+        function["name"] = name
+    if arguments:
+        function["arguments"] = arguments
+    call: dict[str, Any] = {"index": index, "function": function}
+    if call_id:
+        call["id"] = call_id
+        call["type"] = "function"
+    chunk = _build_openai_chunk(
+        stream_id=stream_id,
+        created=created,
+        model=model,
+    )
+    chunk["choices"][0]["delta"]["tool_calls"] = [call]
+    return chunk
+
+
 def _normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any]:
     usage = usage or {}
     prompt_tokens = int(usage.get("input_tokens") or 0)
@@ -86,6 +117,14 @@ def _extract_completed_text(response_obj: dict[str, Any]) -> str:
             if content.get("type") == "output_text" and isinstance(content.get("text"), str):
                 text_parts.append(content["text"])
     return "".join(text_parts)
+
+
+def _extract_completed_function_calls(response_obj: dict[str, Any]) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for item in response_obj.get("output", []) or []:
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            calls.append(item)
+    return calls
 
 
 def _truncate_for_stop_tag(full_response: str, delta: str, find_stop_tag: Callable[[str], int]) -> tuple[str, str]:
@@ -179,6 +218,12 @@ async def forward_responses_as_chat_stream(
     keepalive_interval = 10.0
     keepalive_count = 0
     last_downstream_emit = time.perf_counter()
+    ordinary_tool_seen = False
+    tool_index_by_item_id: dict[str, int] = {}
+    tool_id_by_item_id: dict[str, str] = {}
+    tool_arguments_by_item_id: dict[str, str] = {}
+    suppressed_terminal_item_ids: set[str] = set()
+    next_tool_index = 0
 
     def persist_log(response_text: str, *, raw_sse: str = "", error_type: str | None = None) -> None:
         nonlocal saved_log
@@ -236,6 +281,7 @@ async def forward_responses_as_chat_stream(
             response = await cm.__aenter__()
             deps.log(
                 f"{trace_prefix}responses_upstream_headers status={response.status_code} "
+                f"{format_account_pool_route(response)} "
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
             return client, cm, response
@@ -264,6 +310,8 @@ async def forward_responses_as_chat_stream(
                     yield keepalive
         else:
             client, cm, response = await upstream_task
+
+        deps = scope_stop_detection(deps, response, url, trace_prefix)
 
         try:
             if response.status_code != 200:
@@ -350,6 +398,121 @@ async def forward_responses_as_chat_stream(
                 if response_obj.get("model"):
                     model = response_obj["model"]
 
+                if event_type in {"response.output_item.added", "response.output_item.done"}:
+                    item = data.get("item")
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        name = str(item.get("name") or "")
+                        item_id = str(item.get("id") or item.get("call_id") or f"tool-{next_tool_index}")
+                        call_id = str(item.get("call_id") or item.get("id") or item_id)
+                        if name == TERMINAL_TOOL_NAME:
+                            suppressed_terminal_item_ids.add(item_id)
+                            suppressed_terminal_item_ids.add(call_id)
+                            if ordinary_tool_seen:
+                                deps.log(
+                                    f"{trace_prefix}terminal_tool_invalid protocol=responses "
+                                    "reason=ordinary_tool_already_seen"
+                                )
+                                continue
+                            finish_status = "terminal_tool"
+                            persist_log(
+                                full_response or "[empty response]",
+                                raw_sse="\n".join(raw_sse_lines + ["[TERMINAL_TOOL by proxy]"]),
+                            )
+                            await _close_upstream_stream(
+                                response=response,
+                                client=client,
+                                deps=deps,
+                                trace_prefix=trace_prefix,
+                                label="terminal_tool",
+                                reason="responses_terminal_tool",
+                                started_at=request_t0,
+                                line_count=line_count,
+                                data_line_count=data_line_count,
+                                out_chars=len(full_response),
+                            )
+                            stop_chunk = _build_openai_chunk(
+                                stream_id=stream_id,
+                                created=created,
+                                model=model,
+                                finish_reason="stop",
+                            )
+                            yield f"data: {json.dumps(stop_chunk, ensure_ascii=True)}\n\n".encode()
+                            yield emit_done()
+                            return
+
+                        if item_id not in tool_index_by_item_id:
+                            tool_index_by_item_id[item_id] = next_tool_index
+                            tool_id_by_item_id[item_id] = call_id
+                            if call_id != item_id:
+                                tool_index_by_item_id[call_id] = next_tool_index
+                                tool_id_by_item_id[call_id] = call_id
+                            next_tool_index += 1
+                            ordinary_tool_seen = True
+                            arguments = item.get("arguments")
+                            if not isinstance(arguments, str):
+                                arguments = ""
+                            tool_arguments_by_item_id[item_id] = arguments
+                            if call_id != item_id:
+                                tool_arguments_by_item_id[call_id] = arguments
+                            tool_chunk = _build_openai_tool_chunk(
+                                stream_id=stream_id,
+                                created=created,
+                                model=model,
+                                index=tool_index_by_item_id[item_id],
+                                call_id=call_id,
+                                name=name,
+                                arguments=arguments,
+                            )
+                            last_downstream_emit = time.perf_counter()
+                            yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n".encode()
+                        elif event_type == "response.output_item.done":
+                            arguments = item.get("arguments")
+                            if isinstance(arguments, str):
+                                previous_arguments = tool_arguments_by_item_id.get(item_id, "")
+                                if arguments.startswith(previous_arguments):
+                                    remaining_arguments = arguments[len(previous_arguments):]
+                                elif arguments != previous_arguments:
+                                    remaining_arguments = arguments
+                                else:
+                                    remaining_arguments = ""
+                                if remaining_arguments:
+                                    tool_arguments_by_item_id[item_id] = arguments
+                                    tool_chunk = _build_openai_tool_chunk(
+                                        stream_id=stream_id,
+                                        created=created,
+                                        model=model,
+                                        index=tool_index_by_item_id[item_id],
+                                        arguments=remaining_arguments,
+                                    )
+                                    last_downstream_emit = time.perf_counter()
+                                    yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n".encode()
+                        continue
+
+                if event_type == "response.function_call_arguments.delta":
+                    item_id = str(data.get("item_id") or data.get("call_id") or "")
+                    if item_id in suppressed_terminal_item_ids:
+                        continue
+                    if item_id not in tool_index_by_item_id:
+                        tool_index_by_item_id[item_id] = next_tool_index
+                        tool_id_by_item_id[item_id] = str(data.get("call_id") or item_id)
+                        next_tool_index += 1
+                    ordinary_tool_seen = True
+                    arguments = data.get("delta")
+                    if isinstance(arguments, str) and arguments:
+                        tool_arguments_by_item_id[item_id] = (
+                            tool_arguments_by_item_id.get(item_id, "") + arguments
+                        )
+                        tool_chunk = _build_openai_tool_chunk(
+                            stream_id=stream_id,
+                            created=created,
+                            model=model,
+                            index=tool_index_by_item_id[item_id],
+                            arguments=arguments,
+                        )
+                        last_downstream_emit = time.perf_counter()
+                        yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n".encode()
+                    continue
+
                 if event_type == "response.output_text.delta":
                     delta = data.get("delta", "")
                     if not isinstance(delta, str) or not delta:
@@ -415,6 +578,53 @@ async def forward_responses_as_chat_stream(
                     saw_completed = True
                     if response_obj:
                         final_usage = _normalize_usage(response_obj.get("usage"))
+                        completed_calls = _extract_completed_function_calls(response_obj)
+                        completed_terminal = any(
+                            call.get("name") == TERMINAL_TOOL_NAME
+                            for call in completed_calls
+                        )
+                        completed_ordinary = [
+                            call
+                            for call in completed_calls
+                            if call.get("name") != TERMINAL_TOOL_NAME
+                        ]
+                        if completed_terminal and not ordinary_tool_seen and not completed_ordinary:
+                            stop_chunk = _build_openai_chunk(
+                                stream_id=stream_id,
+                                created=created,
+                                model=model,
+                                finish_reason="stop",
+                            )
+                            persist_log(
+                                full_response or "[empty response]",
+                                raw_sse="\n".join(raw_sse_lines + ["[TERMINAL_TOOL at response.completed]"]),
+                            )
+                            finish_status = "terminal_tool_at_response_completed"
+                            yield f"data: {json.dumps(stop_chunk, ensure_ascii=True)}\n\n".encode()
+                            yield emit_done()
+                            return
+                        for call in completed_ordinary:
+                            item_id = str(call.get("id") or call.get("call_id") or "")
+                            call_id = str(call.get("call_id") or call.get("id") or item_id)
+                            if item_id in tool_index_by_item_id or call_id in tool_index_by_item_id:
+                                continue
+                            arguments = call.get("arguments")
+                            if not isinstance(arguments, str):
+                                arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+                            tool_index = next_tool_index
+                            next_tool_index += 1
+                            ordinary_tool_seen = True
+                            tool_index_by_item_id[item_id or call_id] = tool_index
+                            tool_chunk = _build_openai_tool_chunk(
+                                stream_id=stream_id,
+                                created=created,
+                                model=model,
+                                index=tool_index,
+                                call_id=call_id,
+                                name=str(call.get("name") or ""),
+                                arguments=arguments,
+                            )
+                            yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n".encode()
                         completed_text = _extract_completed_text(response_obj)
                         if not full_response and completed_text:
                             full_response = completed_text
@@ -434,7 +644,7 @@ async def forward_responses_as_chat_stream(
                         stream_id=stream_id,
                         created=created,
                         model=model,
-                        finish_reason="stop",
+                        finish_reason="tool_calls" if ordinary_tool_seen else "stop",
                     )
                     persist_log(
                         full_response or "[empty response]",
@@ -559,8 +769,10 @@ async def collect_responses_as_chat_completion(
     async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
         upstream_t0 = time.perf_counter()
         async with client.stream("POST", url, json=request_data, headers=headers) as response:
+            deps = scope_stop_detection(deps, response, url, trace_prefix)
             deps.log(
                 f"{trace_prefix}responses_collect_headers status={response.status_code} "
+                f"{format_account_pool_route(response)} "
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
             if response.status_code != 200:
@@ -676,7 +888,7 @@ async def collect_responses_nonstream(
     timeout: httpx.Timeout,
     deps: ResponsesUpstreamDeps,
     save_log: bool = True,
-) -> tuple[str, dict[str, Any], str, str]:
+) -> tuple[str, dict[str, Any], str, str, list[dict[str, Any]]]:
     """Call OpenAI Responses upstream as true non-stream JSON and extract assistant text."""
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
@@ -695,9 +907,11 @@ async def collect_responses_nonstream(
             f"elapsed={deps.fmt_ms(request_t0)} model={model}"
         )
         response = await client.post(url, json=payload, headers=headers)
+        deps = scope_stop_detection(deps, response, url, trace_prefix)
         raw_text = response.text
         deps.log(
             f"{trace_prefix}responses_nonstream_response status={response.status_code} "
+            f"{format_account_pool_route(response)} "
             f"elapsed={deps.fmt_ms(upstream_t0)} bytes={len(raw_text.encode(errors='replace'))}"
         )
         if response.status_code != 200:
@@ -757,6 +971,7 @@ async def collect_responses_nonstream(
     if status and status not in {"completed", "incomplete"}:
         finish_reason = status
     out_model = str(data.get("model") or model)
+    function_calls = _extract_completed_function_calls(data)
 
     if save_log:
         deps.save_request_log(
@@ -772,7 +987,7 @@ async def collect_responses_nonstream(
         f"{trace_prefix}responses_nonstream_collect_done elapsed={deps.fmt_ms(request_t0)} "
         f"out_chars={len(full_content)} usage_total={usage.get('total_tokens', 0)} status={status or '-'}"
     )
-    return full_content, usage, finish_reason, raw_text
+    return full_content, usage, finish_reason, raw_text, function_calls
 
 
 async def replay_responses_as_chat_stream(
@@ -887,7 +1102,7 @@ async def replay_responses_as_chat_stream(
 
         while not collect_task.done():
             try:
-                full_content, usage, finish_reason, raw_text = await asyncio.wait_for(
+                full_content, usage, finish_reason, raw_text, function_calls = await asyncio.wait_for(
                     asyncio.shield(collect_task),
                     timeout=keepalive_interval,
                 )
@@ -897,10 +1112,7 @@ async def replay_responses_as_chat_stream(
                 if keepalive:
                     yield keepalive
         else:
-            full_content, usage, finish_reason, raw_text = await collect_task
-
-        if deps.has_stop_tag(full_content):
-            full_content = full_content[:deps.find_stop_tag(full_content)]
+            full_content, usage, finish_reason, raw_text, function_calls = await collect_task
 
         step = max(1, int(chunk_size) or 1200)
         for start in range(0, len(full_content), step):
@@ -908,9 +1120,36 @@ async def replay_responses_as_chat_stream(
             if piece:
                 yield emit_data(make_chunk(delta=piece))
 
+        ordinary_calls: list[dict[str, Any]] = []
+        terminal_tool_seen = False
+        for call in function_calls:
+            if call.get("name") == TERMINAL_TOOL_NAME:
+                terminal_tool_seen = True
+            else:
+                ordinary_calls.append(call)
+        for index, call in enumerate(ordinary_calls):
+            arguments = call.get("arguments")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+            yield emit_data(_build_openai_tool_chunk(
+                stream_id=stream_id,
+                created=created,
+                model=model,
+                index=index,
+                call_id=str(call.get("call_id") or call.get("id") or f"call_{index}"),
+                name=str(call.get("name") or ""),
+                arguments=arguments,
+            ))
+        if ordinary_calls:
+            finish_reason = "tool_calls"
+        elif terminal_tool_seen:
+            finish_reason = "stop"
+            finish_status = "terminal_tool_nonstream_replay"
+
         yield emit_data(make_chunk(finish_reason_value=finish_reason or "stop"))
         yield emit_done()
-        finish_status = "responses_nonstream_replay_completed"
+        if finish_status != "terminal_tool_nonstream_replay":
+            finish_status = "responses_nonstream_replay_completed"
         persist_log("[RESPONSES_NONSTREAM_REPLAY_COMPLETED]", full_content or "[empty response]")
     except asyncio.CancelledError:
         finish_status = "downstream_cancelled"

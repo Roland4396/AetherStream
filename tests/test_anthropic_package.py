@@ -33,14 +33,18 @@ class AnthropicPackageTests(unittest.TestCase):
             },
             'collect_anthropic_messages_as_chat_completion': {
                 'url', 'request_data', 'headers', 'model', 'messages',
-                'trace_id', 'timeout', 'max_raw_sse_bytes', 'deps',
+                'trace_id', 'timeout', 'max_raw_sse_bytes', 'deps', 'upstream_stream',
             },
             'collect_anthropic_messages_response': {
                 'url', 'request_data', 'headers', 'model', 'timeout',
-                'max_raw_sse_bytes', 'deps', 'trace_id',
+                'max_raw_sse_bytes', 'deps', 'trace_id', 'upstream_stream',
             },
         }
 
         for name, expected_parameters in signatures.items():
             parameters = set(inspect.signature(getattr(anthropic_messages, name)).parameters)
             self.assertEqual(parameters, expected_parameters, name)
+            if 'upstream_stream' in parameters:
+                parameter = inspect.signature(getattr(anthropic_messages, name)).parameters['upstream_stream']
+                self.assertIs(parameter.default, True)
+                self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)

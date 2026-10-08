@@ -22,8 +22,11 @@ class RouteDependenciesTests(unittest.TestCase):
 
     def test_route_dependency_declarations_match_handler_usage(self):
         cases = (
-            (chat_routes.chat_completions, chat_routes.CHAT_DEPENDENCY_NAMES),
-            (messages_routes.anthropic_messages, messages_routes.MESSAGES_DEPENDENCY_NAMES),
+            ((chat_routes.chat_completions,
+              chat_routes._plain_claude_when_conversion_disabled,
+              chat_routes._claude_nonstream_to_stream_enabled), chat_routes.CHAT_DEPENDENCY_NAMES),
+            ((messages_routes.anthropic_messages, chat_routes._claude_nonstream_to_stream_enabled),
+             messages_routes.MESSAGES_DEPENDENCY_NAMES),
             (
                 (audio_routes._send_upstream, audio_routes.create_speech, audio_routes.voices),
                 audio_routes.AUDIO_DEPENDENCY_NAMES,

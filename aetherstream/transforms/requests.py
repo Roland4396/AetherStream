@@ -1,6 +1,11 @@
 import json
 from typing import Any
 
+from aetherstream.features.terminal_tool import (
+    convert_openai_chat_tools_to_anthropic,
+    convert_openai_chat_tools_to_responses,
+)
+
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
 
@@ -298,10 +303,12 @@ def convert_chat_to_responses_request(chat_request: dict) -> dict:
                 })
             continue
 
-        input_items.append({
-            "role": role,
-            "content": normalize_chat_content_for_responses(role, content),
-        })
+        normalized_content = normalize_chat_content_for_responses(role, content)
+        if role != "assistant" or normalized_content not in ("", []):
+            input_items.append({
+                "role": role,
+                "content": normalized_content,
+            })
 
         if role == "assistant":
             for tool_call in msg.get("tool_calls", []) or []:
@@ -334,14 +341,29 @@ def convert_chat_to_responses_request(chat_request: dict) -> dict:
     if instructions_parts:
         response_request["instructions"] = "\n\n".join(instructions_parts)
 
+    converted_tools = convert_openai_chat_tools_to_responses(chat_request.get("tools"))
+    if converted_tools:
+        response_request["tools"] = converted_tools
+
+    tool_choice = chat_request.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        if tool_choice.get("type") == "function" and isinstance(function, dict) and function.get("name"):
+            response_request["tool_choice"] = {
+                "type": "function",
+                "name": function["name"],
+            }
+        else:
+            response_request["tool_choice"] = tool_choice
+    elif tool_choice is not None:
+        response_request["tool_choice"] = tool_choice
+
     passthrough_fields = [
         "temperature",
         "top_p",
         "metadata",
         "store",
         "user",
-        "tools",
-        "tool_choice",
         "parallel_tool_calls",
         "prompt_cache_key",
         "prompt_cache_retention",
@@ -883,16 +905,21 @@ def convert_chat_to_anthropic_messages_request(
                 output = content
             else:
                 output = json.dumps(content, ensure_ascii=False)
-            prefix = "[tool_result]"
-            if tool_name:
-                prefix += f" name={tool_name}"
             if call_id:
-                prefix += f" call_id={call_id}"
-            _append_anthropic_message(
-                anthropic_messages,
-                "user",
-                [{"type": "text", "text": f"{prefix}\n{output}"}],
-            )
+                _append_anthropic_message(
+                    anthropic_messages,
+                    "user",
+                    [{"type": "tool_result", "tool_use_id": call_id, "content": output}],
+                )
+            else:
+                prefix = "[tool_result_missing_call_id]"
+                if tool_name:
+                    prefix += f" name={tool_name}"
+                _append_anthropic_message(
+                    anthropic_messages,
+                    "user",
+                    [{"type": "text", "text": f"{prefix}\n{output}"}],
+                )
             continue
 
         if role not in {"user", "assistant"}:
@@ -919,14 +946,22 @@ def convert_chat_to_anthropic_messages_request(
                 name = str(fn.get("name", "")).strip()
                 call_id = str(tool_call.get("id", "")).strip()
                 arguments = fn.get("arguments", "")
-                call_payload = {
-                    "name": name,
-                    "call_id": call_id,
-                    "arguments": arguments,
-                }
+                if not name or not call_id:
+                    continue
+                if isinstance(arguments, dict):
+                    parsed_arguments = arguments
+                else:
+                    try:
+                        parsed_arguments = json.loads(arguments or "{}")
+                    except (TypeError, ValueError):
+                        parsed_arguments = {"raw_arguments": str(arguments or "")}
+                if not isinstance(parsed_arguments, dict):
+                    parsed_arguments = {"value": parsed_arguments}
                 blocks.append({
-                    "type": "text",
-                    "text": f"[assistant_tool_call]\n{json.dumps(call_payload, ensure_ascii=False)}",
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": parsed_arguments,
                 })
 
         _append_anthropic_message(anthropic_messages, role, blocks)
@@ -970,6 +1005,29 @@ def convert_chat_to_anthropic_messages_request(
 
     if system_blocks:
         anthropic_request["system"] = system_blocks
+
+    converted_tools = convert_openai_chat_tools_to_anthropic(chat_request.get("tools"))
+    if converted_tools:
+        anthropic_request["tools"] = converted_tools
+
+    tool_choice = chat_request.get("tool_choice")
+    anthropic_tool_choice: dict[str, Any] | None = None
+    if isinstance(tool_choice, str):
+        choice_type = {
+            "auto": "auto",
+            "none": "none",
+            "required": "any",
+        }.get(tool_choice)
+        if choice_type:
+            anthropic_tool_choice = {"type": choice_type}
+    elif isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        if tool_choice.get("type") == "function" and isinstance(function, dict) and function.get("name"):
+            anthropic_tool_choice = {"type": "tool", "name": function["name"]}
+    if anthropic_tool_choice is not None:
+        if chat_request.get("parallel_tool_calls") is False:
+            anthropic_tool_choice["disable_parallel_tool_use"] = True
+        anthropic_request["tool_choice"] = anthropic_tool_choice
 
     metadata = chat_request.get("metadata")
     if isinstance(metadata, dict):

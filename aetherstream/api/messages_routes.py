@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from aetherstream.features.request_injections import is_kimi_model
+
 import json
 import uuid
 from typing import Any
@@ -8,7 +10,13 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from aetherstream.api.dependencies import RouteDependencies, build_route_dependencies
+from aetherstream.api.chat_routes import CHAT_DEPENDENCY_NAMES, _claude_nonstream_to_stream_enabled
+from aetherstream.api.protocol_gateway import route_protocol_request
 from aetherstream.features.request_injections import append_assistant_prefill_continuation
+from aetherstream.features.terminal_tool import (
+    inject_anthropic_terminal_tool,
+    terminal_tool_enabled_for_model,
+)
 from aetherstream.streaming.json_keepalive import keepalive_json_response
 from aetherstream.streaming.responses import DisconnectSafeStreamingResponse as StreamingResponse
 
@@ -32,6 +40,12 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
             data = deps.strip_claude_cache_controls(data)
         model = data.get('model', '')
         stream = data.get('stream', False)
+        terminal_tool_enabled = terminal_tool_enabled_for_model(model)
+        injected = inject_anthropic_terminal_tool(data) if terminal_tool_enabled else False
+        deps.log(
+            f"[TRACE {trace_id}] terminal_tool_injection protocol=anthropic_messages "
+            f"action={'added' if injected else ('present' if terminal_tool_enabled else 'skipped_model')}"
+        )
         removed_fields = deps.model_policy.apply_claude_sampling_compat(data)
 
         if _is_pioneer_auto_model(model):
@@ -101,15 +115,21 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
                     request_data=data,
                     headers=forward_headers,
                     timeout=deps.get_timeout_config(),
-                    deps=deps.build_anthropic_messages_deps(),
-                    enable_early_stop=False,
+                    deps=deps.build_anthropic_messages_deps(data),
+                    enable_early_stop=is_kimi_model(model),
                     trace_id=trace_id,
                 ),
                 media_type='text/event-stream'
             )
 
-        # 非流式：内部仍走上游流式，再聚合回标准 Anthropic JSON
+        # 非流式：默认内部流式收集；关闭开关时保留上游非流式。
         try:
+            upstream_stream = _claude_nonstream_to_stream_enabled(deps)
+            deps.log(
+                f"[TRACE {trace_id}] claude_nonstream_to_stream "
+                f"enabled={str(upstream_stream).lower()} incoming_stream=false "
+                f"upstream_stream={str(upstream_stream).lower()} model={model}"
+            )
             resp_data, raw_sse = await deps.collect_anthropic_messages_response(
                 url=target_url,
                 request_data=data,
@@ -117,8 +137,9 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
                 model=model,
                 timeout=deps.get_timeout_config(),
                 max_raw_sse_bytes=deps.MAX_RAW_SSE_BYTES,
-                deps=deps.build_anthropic_messages_deps(),
+                deps=deps.build_anthropic_messages_deps(data),
                 trace_id=trace_id,
+                upstream_stream=upstream_stream,
             )
             deps.save_request_log(
                 model,
@@ -168,6 +189,7 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
 
 MESSAGES_DEPENDENCY_NAMES = (
     'MAX_RAW_SSE_BYTES',
+    '_runtime_lookup',
     'build_anthropic_messages_deps',
     'build_claude_messages_url',
     'build_claude_upstream_headers',
@@ -187,22 +209,23 @@ MESSAGES_DEPENDENCY_NAMES = (
 
 def register_routes(app, ctx: dict[str, Any]) -> RouteDependencies:
     deps = build_route_dependencies(ctx, MESSAGES_DEPENDENCY_NAMES)
+    chat_deps = build_route_dependencies(ctx, CHAT_DEPENDENCY_NAMES)
     nonstream_keepalive_interval = float(ctx.get('NONSTREAM_KEEPALIVE_INTERVAL', 10.0))
 
     async def anthropic_messages_endpoint(request: Request):
         try:
             payload = await request.json()
         except Exception:
-            return await anthropic_messages(request, deps)
+            return await route_protocol_request(request, chat_deps, protocol="anthropic")
 
         if not isinstance(payload, dict) or payload.get('stream', False):
-            return await anthropic_messages(request, deps)
+            return await route_protocol_request(request, chat_deps, protocol="anthropic")
 
         return keepalive_json_response(
-            lambda: anthropic_messages(request, deps),
+            lambda: route_protocol_request(request, chat_deps, protocol="anthropic"),
             interval=nonstream_keepalive_interval,
             trace_id=getattr(request.state, 'trace_id', ''),
-            log=deps.log,
+            log=chat_deps.log,
         )
 
     app.post('/v1/messages')(anthropic_messages_endpoint)

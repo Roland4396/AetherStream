@@ -1,44 +1,35 @@
-# 安全说明
+# 安全与密钥边界
 
-AetherStream 是一个 LLM 代理层，运行时会接触 API Key、请求正文、模型回复和上游错误信息。
+## 适用环境
 
-## 不要提交的内容
+这是面向可信本地环境的实现参考快照，不是已经加固的公网、多租户网关。示例 Compose 仅绑定 `127.0.0.1`；远程访问必须先由独立反向代理提供认证和访问控制。
 
-请不要提交或公开：
+为忠实保留实现过程，本快照保留以下现有行为，并明确说明：
 
-- `.env`
-- `runtime-flags.json`
-- `logs/`
-- raw SSE 日志
-- 请求输入 / 输出日志
-- 真实 API Key、Bearer Token、x-api-key
-- 私有上游 URL
+- `FIXED_API_KEY` 当前仅被读取，**没有执行普通 API 的客户端认证**。不要把这个变量当成访问保护。
+- `/admin/replay`、`/admin/claude-replay` 及其日志读取接口没有应用层认证，不得直接暴露给非可信客户端。
+- quota-keeper 和 lifecycle 管理接口另有独立的 token 文件认证，缺失时拒绝访问；这不等于其他接口也已受保护。
+- OpenAI-compatible 渠道没有配置自己的 key 时，可能把客户端 Authorization 透传给所配置的上游，包括模型目录请求。请按渠道配置 `api_key_env`，不要复用外层网关或管理凭据。
+- 请求、响应和 raw SSE 日志保留诊断正文，**不是完整密钥脱敏器**。放进消息、任意请求字段、URL 或上游错误正文中的 key 可能被保存。拒绝原因摘要的脱敏不等于整套日志脱敏。
 
-## 推荐配置方式
+## 不得公开的内容
 
-优先使用环境变量保存密钥：
+不要提交或上传 `.env`、真实运行配置、凭据文件、私钥、数据库、聊天日志、回放记录、release 状态或含账号数据的上游响应。`api_key_env` 存的是环境变量名，不是变量值。凭据放在镜像外；需要挂载时使用只读文件。
 
-```json
-{
-  "name": "my-provider",
-  "base_url": "https://api.example.com/v1",
-  "api_key_env": "MY_PROVIDER_API_KEY"
-}
-```
+Git/Docker 忽略规则只是防误操作，不是加密，也不能代替提交审查。不要用强制添加命令提交私有配置。真实 key 一旦泄露，应先撤销或轮换；删除后续版本中的文件不会撤销 key，也不会消除已有副本。
 
-然后在 `.env` 中配置：
+## 发布前复查
 
-```env
-MY_PROVIDER_API_KEY=your-real-key
-```
-
-## 发布前检查
-
-发布前建议执行：
+使用本地安装的 [Gitleaks](https://github.com/gitleaks/gitleaks)，保持扫描输出脱敏：
 
 ```bash
-python -m py_compile *.py
-rg -n "sk-|ant-api|pio_sk_|AIza|Bearer |api_key|secret|token" --glob "!logs/**" --glob "!runtime-flags.json" .
+gitleaks git --log-opts="--all --full-history" --redact=100 .
 ```
 
-并人工确认所有命中项都是占位符或代码字段名。
+另外对真正要分发的干净导出目录运行 `gitleaks dir --redact=100 <export-directory>`，逐条复核命中。仓库扫描配置只放行指定源文件/测试路径里的两个精确非秘密字面量，没有排除整个目录或历史提交。
+
+本次范围、结论和局限见 [密钥审计报告](docs/security-audit-20261009.md)。扫描通过不代表可以检测所有可能的秘密格式。
+
+## 报告问题
+
+不要在公开 issue 里粘贴实际 key、token、Cookie 或完整私有日志。用假值描述受影响的文件、接口和行为，证据分享前单独脱敏。

@@ -71,6 +71,22 @@ class ProxyLoggerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_conversion_decision_is_visible_without_verbose_trace(self):
+        self.logger.verbose_trace = False
+        self.assertTrue(self.logger._should_emit(
+            '[TRACE offline] claude_nonstream_to_stream enabled=false '
+            'incoming_stream=false upstream_stream=false model=「anti5」claude-opus-5-5'
+        ))
+
+    def test_json_heartbeat_and_session_retirement_are_visible_without_verbose_trace(self):
+        self.logger.verbose_trace = False
+        for message in (
+            '[TRACE offline] nonstream_keepalive_emit count=1 elapsed=10s',
+            '[TRACE offline] nonstream_keepalive_done keepalives=2 body_bytes=100',
+            '[TRACE offline] claude_session_retired reason=upstream_refusal retired=true',
+        ):
+            self.assertTrue(self.logger._should_emit(message))
+
     def _save(self, index: int, raw_sse: str = "") -> None:
         self.logger.save_request_log(
             model=f"model-{index}",
@@ -105,6 +121,42 @@ class ProxyLoggerTests(unittest.TestCase):
             output = (self.log_dir / f"{slot}_output.txt").read_text(encoding="utf-8")
             self.assertIn(f"Model: {payload['model']}\n", output)
             self.assertIn(f"TraceId: {payload['trace_id']}\n", output)
+
+    def test_output_log_includes_reasoning_separately_from_content(self):
+        raw_sse = "\n".join([
+            'data: {"model":"kimi-k3","choices":[{"delta":{"reasoning_content":"first "}}]}',
+            'data: {"model":"kimi-k3","choices":[{"delta":{"reasoning_content":"second"}}]}',
+            'data: {"model":"kimi-k3","choices":[{"delta":{"content":"answer"},"finish_reason":null}]}',
+            'data: {"model":"kimi-k3","choices":[{"delta":{},"finish_reason":"stop"}]}',
+            'data: [DONE]',
+        ])
+
+        self.logger.save_request_log(
+            model="transsion/kimi-k3",
+            messages=[],
+            response="answer",
+            stream=True,
+            raw_sse=raw_sse,
+        )
+
+        output = (self.log_dir / "01_output.txt").read_text(encoding="utf-8")
+        self.assertIn("ReasoningLength: 12\n", output)
+        self.assertIn("--- reasoning_content ---\nfirst second\n", output)
+        self.assertIn("--- content ---\nanswer", output)
+
+    def test_output_log_without_reasoning_keeps_legacy_body_format(self):
+        self.logger.save_request_log(
+            model="plain-model",
+            messages=[],
+            response="plain answer",
+            stream=True,
+            raw_sse='data: {"choices":[{"delta":{"content":"plain answer"},"finish_reason":"stop"}]}',
+        )
+
+        output = (self.log_dir / "01_output.txt").read_text(encoding="utf-8")
+        self.assertNotIn("ReasoningLength:", output)
+        self.assertNotIn("--- content ---", output)
+        self.assertTrue(output.endswith("=" * 50 + "\nplain answer"))
 
     def test_suppresses_normal_asgi_completion_but_keeps_failure(self):
         normal = (

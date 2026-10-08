@@ -1,6 +1,13 @@
 from dataclasses import dataclass
 
 
+OPENAI_SUBSCRIPTION_MODELS = frozenset({
+    'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna',
+    'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5',
+    'codex-auto-review',
+})
+
+
 @dataclass(frozen=True)
 class ModelPolicy:
     responses_models: frozenset[str]
@@ -53,7 +60,8 @@ class ModelPolicy:
     def is_gpt_model(self, model_name: str) -> bool:
         if not model_name:
             return False
-        return model_name.lower().startswith("gpt-")
+        name = model_name.lower()
+        return name.startswith("gpt-") or name == 'codex-auto-review'
 
     def is_model_allowed(self, model_name: str) -> bool:
         # Do not hard-reject unknown upstream model ids. The allow-lists are used

@@ -17,6 +17,7 @@ import copy
 import re
 import asyncio
 from typing import Any, AsyncGenerator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -25,7 +26,15 @@ from aetherstream.api.audio_routes import register_routes as register_audio_rout
 from aetherstream.api.admin_routes import register_routes as register_admin_routes
 from aetherstream.api.chat_routes import register_routes as register_chat_routes
 from aetherstream.api.messages_routes import register_routes as register_messages_routes
+from aetherstream.api.responses_routes import register_routes as register_responses_routes
 from aetherstream.api.system_routes import register_routes as register_system_routes
+from aetherstream.api.quota_keeper_routes import register_routes as register_quota_keeper_routes
+from aetherstream.features.quota_keeper import QuotaKeeper
+from aetherstream.features.gproxy_oauth import GproxyOAuthRecovery
+from aetherstream.runtime.lifecycle import RuntimeLifecycle, LifecycleMiddleware
+from aetherstream.runtime.shared import SharedRuntimeState
+from aetherstream.runtime.tasks import pending_count as detached_task_count
+from aetherstream.api.lifecycle_routes import register_routes as register_lifecycle_routes
 from aetherstream.config.urls import (
     normalize_openai_responses_base_url,
     normalize_openai_chat_base_url,
@@ -49,7 +58,7 @@ from aetherstream.upstreams.gemini_generate_content import (
     collect_gemini_generate_content,
     forward_gemini_generate_content_stream,
 )
-from aetherstream.routing.model_policy import ModelPolicy
+from aetherstream.routing.model_policy import ModelPolicy, OPENAI_SUBSCRIPTION_MODELS
 from aetherstream.upstreams.openai_chat_completions import (
     ChatCompletionsUpstreamDeps,
     collect_chat_completions_nonstream,
@@ -90,13 +99,23 @@ from aetherstream.features.gpt_policy import (
 from aetherstream.features.early_stop import (
     DEFAULT_EARLY_STOP_TAGS,
     EarlyStopMatcher,
+    bind_content_guard,
 )
 from aetherstream.features.pro_compat import (
     apply_pro_no_reasoning_payload,
     should_append_pro_opus46_last_user_note,
 )
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await runtime_lifecycle.start()
+    try:
+        yield
+    finally:
+        await runtime_lifecycle.stop()
+
+
+app = FastAPI(lifespan=lifespan)
 # Upstream service configuration
 GEMINI_BASE_URL = os.environ.get('GEMINI_BASE_URL', 'https://generativelanguage.googleapis.com').rstrip('/')
 TIMEOUT = int(os.environ.get('TIMEOUT', '600'))
@@ -378,11 +397,18 @@ def get_openai_compatible_upstreams() -> list[dict[str, Any]]:
             'inject_opus_note': _coerce_bool(item.get('inject_opus_note'), False),
             'drop_request_fields': _coerce_string_list(item.get('drop_request_fields'), []),
             'enable_thinking': item.get('enable_thinking') if isinstance(item.get('enable_thinking'), bool) else None,
+            'thinking': item.get('thinking') if isinstance(item.get('thinking'), bool) else None,
+            'effort': str(item.get('effort') or '').strip(),
+            'reasoning_effort': str(item.get('reasoning_effort') or '').strip(),
         })
     return upstreams
 
 
 def _upstream_allows_model(upstream: dict[str, Any], model_id: str) -> bool:
+    # GPT and the explicitly enabled reviewer belong to the subscription route,
+    # never to an older third-party model-directory route.
+    if model_policy.is_gpt_model(model_id):
+        return False
     families = upstream.get('include_model_families')
     if not isinstance(families, list) or not families:
         return True
@@ -570,6 +596,10 @@ async def refresh_model_directory(
                         'pioneer_upstream': False,
                         'inject_opus_note': bool(upstream.get('inject_opus_note')),
                         'drop_request_fields': list(upstream.get('drop_request_fields') or []),
+                        'enable_thinking': upstream.get('enable_thinking'),
+                        'thinking': upstream.get('thinking'),
+                        'effort': upstream.get('effort') or '',
+                        'reasoning_effort': upstream.get('reasoning_effort') or '',
                     }
                     upstream_model_count += 1
                 log(
@@ -636,6 +666,10 @@ async def refresh_model_directory(
                     'pioneer_upstream': pioneer_router_listing,
                     'inject_opus_note': bool(upstream.get('inject_opus_note')),
                     'drop_request_fields': list(upstream.get('drop_request_fields') or []),
+                    'enable_thinking': upstream.get('enable_thinking'),
+                    'thinking': upstream.get('thinking'),
+                    'effort': upstream.get('effort') or '',
+                    'reasoning_effort': upstream.get('reasoning_effort') or '',
                 }
                 upstream_model_count += 1
             log(
@@ -673,10 +707,15 @@ async def resolve_openai_compatible_route(
     model_id = str(model or '').strip()
     if not model_id:
         return None
+    if model_policy.is_gpt_model(model_id):
+        return None  # Use the dedicated subscription Responses upstream.
     directory = await refresh_model_directory(request_authorization=request_authorization)
     routes = directory.get('routes')
     if isinstance(routes, dict) and model_id in routes:
         route = routes[model_id]
+        if _requires_native_claude_route(model_id, route):
+            log(f"model_directory native_messages model={model_id} upstream=account-pool-claude")
+            return None
         if isinstance(route, dict):
             log(
                 "model_directory route_hit "
@@ -687,6 +726,9 @@ async def resolve_openai_compatible_route(
     routes = directory.get('routes')
     if isinstance(routes, dict):
         route = routes.get(model_id)
+        if _requires_native_claude_route(model_id, route):
+            log(f"model_directory native_messages model={model_id} upstream=account-pool-claude")
+            return None
         if isinstance(route, dict):
             log(
                 "model_directory route_hit_after_refresh "
@@ -935,6 +977,11 @@ def _current_claude_session_id(
     own continuity does not get reset every call.  A new session id is minted
     only after the session has been idle for the configured TTL.
     """
+    if shared_runtime_state is not None:
+        ttl_sec = get_claude_session_ttl_sec()
+        session_key = _normalize_claude_session_key(model=model, provider=provider)
+        session_id, mode = shared_runtime_state.session(session_key, ttl_sec, now)
+        return session_id, mode, ttl_sec, session_key
     now = time.monotonic() if now is None else now
     ttl_sec = get_claude_session_ttl_sec()
     session_key = _normalize_claude_session_key(model=model, provider=provider)
@@ -983,6 +1030,17 @@ def build_claude_user_id_for_session(session_id: str) -> str:
     return f"{raw}_session_{session_id}"
 
 
+def retire_claude_session(session_key: str, expected_session_id: str) -> bool:
+    if shared_runtime_state is not None:
+        return shared_runtime_state.retire_session(session_key, expected_session_id)
+    with _claude_session_lock:
+        current = _claude_session_states.get(session_key)
+        if not current or current.get('session_id') != expected_session_id:
+            return False
+        del _claude_session_states[session_key]
+        return True
+
+
 def build_timed_claude_user_id(
     *,
     model: Any = None,
@@ -1010,8 +1068,7 @@ def apply_claude_client_compat_request(payload: dict) -> tuple[dict, dict[str, s
         tools = sanitized.get('tools')
         if isinstance(tools, list):
             if tools:
-                sanitized['tools'] = []
-                compat_meta['tools'] = f'replaced_with_empty:{len(tools)}'
+                compat_meta['tools'] = f'preserved:{len(tools)}'
             else:
                 sanitized['tools'] = []
                 compat_meta['tools'] = 'kept_empty'
@@ -1067,8 +1124,55 @@ def apply_claude_client_compat_request(payload: dict) -> tuple[dict, dict[str, s
     return sanitized, compat_meta
 
 
+def is_claude_opus55_model(model: Any) -> bool:
+    # Channel prefixes ([m1], free/, etc.) and provider suffixes are aliases
+    # of the same model. Keep a version boundary so 5-50 is not treated as 5-5.
+    model_id = str(model or '').strip().lower()
+    return re.search(r'claude-opus-5[-.]5(?!\d)', model_id) is not None
+
+
+def _requires_native_claude_route(model: str, route: Any) -> bool:
+    return (isinstance(route, dict) and route.get('name') == 'account-pool-claude'
+            and is_claude_opus55_model(model))
+
+
 def apply_claude_model_compat_request(payload: dict) -> tuple[dict, dict[str, str]]:
     model = str(payload.get('model') or '').strip()
+    if is_claude_opus55_model(model):
+        # Opus 5.5 only accepts adaptive thinking; the global disabled
+        # preference remains valid for other models. Preserve positive effort
+        # settings, but remove disabling aliases used by OpenAI gateways.
+        sanitized = copy.deepcopy(payload)
+        thinking = sanitized.get('thinking')
+        adaptive: dict[str, Any] = {'type': 'adaptive'}
+        if isinstance(thinking, dict) and 'display' in thinking:
+            adaptive['display'] = thinking['display']
+        sanitized['thinking'] = adaptive
+        removed: list[str] = []
+        for key in ('reasoning_effort', 'effort'):
+            if str(sanitized.get(key) or '').strip().lower() in {'none', 'disabled', 'off'}:
+                sanitized.pop(key)
+                removed.append(key)
+        for key in ('reasoning', 'output_config'):
+            config = sanitized.get(key)
+            if isinstance(config, dict) and str(config.get('effort') or '').strip().lower() in {'none', 'disabled', 'off'}:
+                config.pop('effort')
+                removed.append(f'{key}.effort')
+                if not config:
+                    sanitized.pop(key)
+        kwargs = sanitized.get('chat_template_kwargs')
+        if isinstance(kwargs, dict):
+            for key in ('enable_thinking', 'thinking'):
+                if kwargs.get(key) is False:
+                    kwargs.pop(key)
+                    removed.append(f'chat_template_kwargs.{key}')
+            if not kwargs:
+                sanitized.pop('chat_template_kwargs')
+        meta = {'thinking': 'opus55_forced_adaptive'}
+        if removed:
+            meta['removed'] = ','.join(removed)
+        return sanitized, meta
+
     if is_claude_fable_model(model):
         sanitized = copy.deepcopy(payload)
         compat_meta: dict[str, str] = {}
@@ -1134,7 +1238,6 @@ REPLAY_CONTROL_FILE = os.environ.get(
 CLAUDE_REPLAY_CONTROL_FILE = REPLAY_CONTROL_FILE
 
 proxy_logger = ProxyLogger(debug=DEBUG, log_dir=LOG_DIR)
-active_stream_registry = ActiveStreamRegistry(log=proxy_logger.log)
 
 # Short-lived exact-request coalescing for true non-stream upstreams.
 #
@@ -1148,7 +1251,7 @@ NONSTREAM_DEDUPE_TTL = float(os.environ.get('NONSTREAM_DEDUPE_TTL', '180'))
 
 model_policy = ModelPolicy(
     responses_models=frozenset(),
-    allowed_gpt_models=frozenset({'gpt-5.6-sol'}),
+    allowed_gpt_models=OPENAI_SUBSCRIPTION_MODELS,
     allowed_gemini_models=frozenset({'gemini-3.1-pro-preview', 'gemini-3-flash-preview'}),
     allowed_claude_models=frozenset({
         'claude-fable-5',
@@ -1165,9 +1268,14 @@ def log(msg: str):
     proxy_logger.log(msg)
 
 
+shared_runtime_state = (SharedRuntimeState(os.environ['STREAM_SHARED_STATE_DIR'])
+                        if os.environ.get('STREAM_SHARED_STATE_DIR') else None)
+active_stream_registry = ActiveStreamRegistry(log=proxy_logger.log, shared_state=shared_runtime_state)
+
 nonstream_coalescer = ExactRequestCoalescer(
     ttl=NONSTREAM_DEDUPE_TTL,
     log=log,
+    shared_state=shared_runtime_state,
 )
 
 
@@ -1180,6 +1288,48 @@ runtime_flags = RuntimeFlags(
 
 def _runtime_lookup(*keys):
     return runtime_flags.lookup(*keys)
+
+
+quota_keeper = QuotaKeeper(
+    lookup=_runtime_lookup,
+    state_dir=os.environ.get('QUOTA_KEEPER_STATE_DIR', '/app/data/quota-keeper'),
+    base_url=os.environ.get('QUOTA_KEEPER_GPROXY_BASE_URL', 'http://gproxy:8787'),
+    credentials_file=os.environ.get(
+        'QUOTA_KEEPER_GPROXY_CREDENTIALS_FILE', '/run/secrets/quota-keeper/gproxy.env'),
+    log=log,
+)
+app.state.quota_keeper = quota_keeper
+
+gproxy_oauth_recovery = GproxyOAuthRecovery(
+    base_url=quota_keeper.base_url,
+    credentials_file=quota_keeper.credentials_file,
+    trusted_url=CLAUDE_BASE_URL,
+    shared_state=shared_runtime_state,
+    log=log,
+)
+
+
+def validate_release_readiness():
+    # A malformed new config must fail readiness rather than relying on stale
+    # cached defaults when promoting a new instance.
+    if os.path.isfile(RUNTIME_FLAGS_PATH):
+        with open(RUNTIME_FLAGS_PATH, encoding='utf-8') as file:
+            if not isinstance(json.load(file), dict):
+                raise ValueError('Runtime flags must be an object')
+
+
+runtime_lifecycle = RuntimeLifecycle(
+    instance=os.environ.get('STREAM_INSTANCE_ID', 'standalone'),
+    control_file=os.environ.get('STREAM_ACTIVE_CONTROL_FILE', ''),
+    state_dir=os.environ.get('STREAM_LIFECYCLE_STATE_DIR', os.path.join(LOG_DIR, '.runtime')),
+    readiness_check=validate_release_readiness,
+    log=log,
+)
+runtime_lifecycle.register_background('quota_keeper', quota_keeper)
+runtime_lifecycle.register_drain_barrier('request_owned_background', detached_task_count)
+runtime_lifecycle.register_drain_barrier('nonstream_coalescer', lambda: len(nonstream_coalescer._inflight))
+runtime_lifecycle.register_drain_barrier('stream_cancel_monitors', lambda: len(active_stream_registry._monitors))
+app.state.runtime_lifecycle = runtime_lifecycle
 
 
 early_stop_matcher = EarlyStopMatcher(
@@ -1451,13 +1601,17 @@ def build_chat_completions_upstream_deps() -> ChatCompletionsUpstreamDeps:
     )
 
 
-def build_anthropic_messages_deps() -> AnthropicMessagesDeps:
+def build_anthropic_messages_deps(request_data: dict | None = None) -> AnthropicMessagesDeps:
+    scoped_find_stop_tag = bind_content_guard(find_stop_tag, request_data, log=log)
     return AnthropicMessagesDeps(
         log=log,
         save_request_log=save_request_log,
         build_openai_sse_error=build_openai_sse_error,
-        has_stop_tag=has_stop_tag,
-        find_stop_tag=find_stop_tag,
+        has_stop_tag=lambda text: scoped_find_stop_tag(text) >= 0,
+        find_stop_tag=scoped_find_stop_tag,
+        shared_runtime_state=shared_runtime_state,
+        retire_session=retire_claude_session,
+        recover_oauth=gproxy_oauth_recovery.recover,
         fmt_ms=fmt_ms,
         release_caller=release_active_stream_caller,
         header_keepalive_enabled=_coerce_bool(
@@ -1710,12 +1864,26 @@ def build_gemini_generate_content_deps() -> GeminiGenerateContentDeps:
 
 messages_route_dependencies = register_messages_routes(app, ctx=globals())
 chat_route_dependencies = register_chat_routes(app, ctx=globals())
+responses_route_dependencies = register_responses_routes(app, ctx=globals())
 audio_route_dependencies = register_audio_routes(app, ctx=globals())
 system_route_dependencies = register_system_routes(app, ctx=globals())
 admin_route_dependencies = register_admin_routes(app, ctx=globals())
+register_quota_keeper_routes(
+    app, keeper=quota_keeper,
+    admin_token_file=os.environ.get('QUOTA_KEEPER_ADMIN_TOKEN_FILE', ''),
+)
 
 
 if __name__ == '__main__':
     import uvicorn
     port = int(os.environ.get('PORT', '3002'))
     uvicorn.run(app, host='0.0.0.0', port=port)
+
+register_lifecycle_routes(
+    app, runtime=runtime_lifecycle,
+    token_file=os.environ.get('STREAM_ADMIN_TOKEN_FILE', os.environ.get('QUOTA_KEEPER_ADMIN_TOKEN_FILE', '')),
+    diagnostics=os.environ.get('STREAM_DIAGNOSTICS_ENABLED', 'false').lower() == 'true',
+)
+
+# Outermost user middleware: include final sends and request-scoped cleanup.
+app.add_middleware(LifecycleMiddleware, runtime=runtime_lifecycle)

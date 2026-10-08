@@ -1,4 +1,8 @@
 {
+  "quota_keeper": {
+    "enabled": false,
+    "check_interval_sec": 60
+  },
   "openai_compatible_upstreams": [
     {
       "name": "example-openai-compatible",
@@ -15,7 +19,8 @@
       "idle_timeout": {
         "enabled": false,
         "seconds": 4
-      }
+      },
+      "nonstream_to_stream": true
     },
     "prompt_caching": {
       "enabled": false,

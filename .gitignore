@@ -28,3 +28,20 @@ logs/
 *.bak-*
 *_bak*
 *~
+
+# Persistent background-feature state
+data/
+
+# Live release journal, leases, cache, and active route
+deploy/control/
+deploy/state/
+
+# Credential material and local databases (never publish)
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+.gitleaks-report*.json

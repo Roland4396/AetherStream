@@ -12,7 +12,8 @@ from typing import Any
 
 
 class ExactRequestCoalescer:
-    def __init__(self, *, ttl: float, log: Callable[[str], None]):
+    def __init__(self, *, ttl: float, log: Callable[[str], None], shared_state=None):
+        self.shared_state = shared_state
         self.ttl = max(0.0, float(ttl))
         self._log = log
         self._lock = asyncio.Lock()
@@ -42,7 +43,10 @@ class ExactRequestCoalescer:
         runner: Callable[[], Awaitable[dict]],
     ) -> dict:
         try:
-            result = await runner()
+            if self.shared_state is not None:
+                result, cross_shared = await self.shared_state.exact_response(key, self.ttl, runner)
+            else:
+                result, cross_shared = await runner(), False
         except BaseException:
             async with self._lock:
                 current = self._inflight.get(key)
@@ -56,6 +60,7 @@ class ExactRequestCoalescer:
                 self._inflight.pop(key, None)
                 self._recent[key] = {
                     'payload': copy.deepcopy(result),
+                    'cross_shared': cross_shared,
                     'stored_at': time.monotonic(),
                     'trace_id': trace_id,
                     'upstream': upstream_label,
@@ -122,7 +127,7 @@ class ExactRequestCoalescer:
                 )
 
         result = await asyncio.shield(task)
-        return copy.deepcopy(result), not leader
+        return copy.deepcopy(result), (not leader or bool(self._recent.get(dedupe_key, {}).get('cross_shared')))
 
     async def state(self) -> dict[str, int]:
         async with self._lock:

@@ -1,5 +1,7 @@
 """Provider-independent replay control and log listing helpers."""
 
+from filelock import FileLock
+
 import json
 import os
 import re
@@ -21,7 +23,8 @@ class ReplayStore:
         self.log_dir = log_dir
         self.control_file = control_file
         self._log = log
-        self._control_lock = threading.RLock()
+        self._control_lock = FileLock(self.control_file + '.lock')
+        self._artifact_lock = FileLock(os.path.join(self.log_dir, '.request-log.lock'))
 
     def resolve_path(self, path_value: str | None) -> str | None:
         if not path_value:
@@ -54,7 +57,12 @@ class ReplayStore:
             return ''
         for index, line in enumerate(lines[:12]):
             if line and set(line) == {'='}:
-                return '\n'.join(lines[index + 1:])
+                body = lines[index + 1:]
+                try:
+                    content_index = body.index('--- content ---')
+                except ValueError:
+                    return '\n'.join(body)
+                return '\n'.join(body[content_index + 1:])
         return '\n'.join(lines)
 
     def lookup(self, *, model: str, messages: list) -> dict[str, Any]:
@@ -65,7 +73,7 @@ class ReplayStore:
         caller should fail closed instead of unexpectedly spending an upstream
         request.
         """
-        with self._control_lock:
+        with self._control_lock, self._artifact_lock:
             if not os.path.isfile(self.control_file):
                 return {'status': 'disabled'}
 

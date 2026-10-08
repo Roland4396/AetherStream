@@ -8,6 +8,11 @@ from typing import Any, AsyncGenerator, Callable
 
 import httpx
 
+from aetherstream.features.early_stop import is_himodels_upstream
+from aetherstream.features.glm_thinking import enforce_glm52_official_thinking
+from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME, OpenAIChatTerminalDetector
+from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection
+
 
 @dataclass
 class ChatCompletionsUpstreamDeps:
@@ -92,23 +97,27 @@ def _build_openai_chunk(
     }
 
 
+def _coerce_openai_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts)
+    return ""
+
+
 def _extract_openai_message_content(data: dict[str, Any]) -> str:
     if "choices" not in data or not data["choices"]:
         return ""
     choice = data["choices"][0]
     message = choice.get("message", {})
     if isinstance(message, dict):
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-            return "".join(parts)
+        return _coerce_openai_text_content(message.get("content"))
     return ""
 
 
@@ -483,6 +492,7 @@ async def forward_chat_completions_stream(
     trace_id: str = "",
     caller_key: str = "",
     caller_desc: str = "",
+    supersede_event: asyncio.Event | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """OpenAI-compatible streaming forwarder with downstream keepalive.
 
@@ -494,6 +504,7 @@ async def forward_chat_completions_stream(
     """
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
+    enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     content_buffer = ""
     full_response = ""
     raw_sse_lines: list[str] = []
@@ -518,6 +529,8 @@ async def forward_chat_completions_stream(
     keepalive_interval = 10.0
     last_downstream_emit = time.perf_counter()
     keepalive_count = 0
+    terminal_detector = OpenAIChatTerminalDetector()
+    pending_tool_lines: list[str] = []
 
     def persist_stream_log(marker: str = "", response_override=None):
         nonlocal saved_log
@@ -628,6 +641,13 @@ async def forward_chat_completions_stream(
 
     upstream_task: asyncio.Task | None = None
 
+    class StreamSuperseded(Exception):
+        pass
+
+    def raise_if_superseded() -> None:
+        if supersede_event is not None and supersede_event.is_set():
+            raise StreamSuperseded
+
     async def open_upstream() -> tuple[httpx.AsyncClient, Any, httpx.Response]:
         client = httpx.AsyncClient(timeout=timeout)
         try:
@@ -640,6 +660,7 @@ async def forward_chat_completions_stream(
             response = await cm.__aenter__()
             deps.log(
                 f"{trace_prefix}upstream_headers status={response.status_code} "
+                f"{format_account_pool_route(response)} "
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
             return client, cm, response
@@ -648,23 +669,35 @@ async def forward_chat_completions_stream(
             raise
 
     try:
+        raise_if_superseded()
         # Start the downstream stream immediately, before upstream headers arrive.
         # Empty delta is a no-op for visible text but proves liveness to the client.
         yield emit_data(make_keepalive_chunk(), ensure_ascii=True)
 
         upstream_task = asyncio.create_task(open_upstream())
         while not upstream_task.done():
+            raise_if_superseded()
             try:
-                client, cm, response = await asyncio.wait_for(asyncio.shield(upstream_task), timeout=keepalive_interval)
+                client, cm, response = await asyncio.wait_for(
+                    asyncio.shield(upstream_task),
+                    timeout=1.0 if supersede_event is not None else keepalive_interval,
+                )
                 break
             except asyncio.TimeoutError:
+                raise_if_superseded()
                 keepalive = emit_keepalive("waiting_headers")
                 if keepalive is not None:
                     yield keepalive
         else:
             client, cm, response = await upstream_task
 
+        deps = scope_stop_detection(deps, response, url, trace_prefix)
+
         try:
+            if is_himodels_upstream(response, url):
+                enable_early_stop = True
+                deps.log(f"{trace_prefix}himodels_early_stop=runtime_config")
+            raise_if_superseded()
             if response.status_code != 200:
                 content = await response.aread()
                 error_text = content.decode(errors="replace")
@@ -711,12 +744,14 @@ async def forward_chat_completions_stream(
             reader_task = asyncio.create_task(read_upstream_lines())
             try:
                 while True:
+                    raise_if_superseded()
                     try:
                         queued_line = await asyncio.wait_for(
                             line_queue.get(),
-                            timeout=keepalive_interval,
+                            timeout=1.0 if supersede_event is not None else keepalive_interval,
                         )
                     except asyncio.TimeoutError:
+                        raise_if_superseded()
                         keepalive = emit_keepalive("waiting_line")
                         if keepalive is not None:
                             yield keepalive
@@ -741,6 +776,9 @@ async def forward_chat_completions_stream(
                         max_raw_sse_bytes=max_raw_sse_bytes,
                     )
                     if not line:
+                        if pending_tool_lines:
+                            pending_tool_lines.append(line)
+                            continue
                         append_downstream_line("")
                         last_downstream_emit = time.perf_counter()
                         yield b"\n"
@@ -757,10 +795,19 @@ async def forward_chat_completions_stream(
 
                         json_str = line[6:].strip()
                         if json_str == "[DONE]":
+                            for pending_line in pending_tool_lines:
+                                yield emit_line(pending_line)
+                            pending_tool_lines.clear()
                             saw_done = True
-                            if not saw_finish_reason:
-                                finish_status = "upstream_done_without_finish_reason"
-                                persist_stream_log("[UPSTREAM_DONE_WITHOUT_FINISH_REASON]")
+                            finish_status = "upstream_done_local_finalized"
+                            persist_stream_log("[UPSTREAM_DONE_LOCAL_FINALIZED]")
+                            stop_chunk = _build_openai_chunk(
+                                stream_id=last_chunk_id,
+                                created=last_chunk_created,
+                                model=last_chunk_model,
+                                finish_reason="stop",
+                            )
+                            yield emit_data(stop_chunk)
                             yield emit_done()
                             return
 
@@ -793,13 +840,70 @@ async def forward_chat_completions_stream(
                                     deps.log(f"{trace_prefix}upstream_aborted_event swallowed")
                                     continue
 
-                                content = _extract_openai_content(data)
                                 if data.get("id"):
                                     last_chunk_id = data.get("id")
                                 if isinstance(data.get("created"), int):
                                     last_chunk_created = data.get("created")
                                 if data.get("model"):
                                     last_chunk_model = data.get("model")
+
+                                tool_decision = terminal_detector.feed(data)
+                                if tool_decision.has_tool_data:
+                                    pending_tool_lines.append(line)
+                                    if tool_decision.terminal:
+                                        terminal_remainder = json.loads(json.dumps(data))
+                                        remainder_present = False
+                                        for remainder_choice in terminal_remainder.get("choices", []) or []:
+                                            if not isinstance(remainder_choice, dict):
+                                                continue
+                                            remainder_choice["finish_reason"] = None
+                                            remainder_delta = remainder_choice.get("delta")
+                                            if isinstance(remainder_delta, dict):
+                                                remainder_delta.pop("tool_calls", None)
+                                                remainder_delta.pop("function_call", None)
+                                                remainder_present = remainder_present or bool(remainder_delta)
+                                        if remainder_present:
+                                            remainder_content = _extract_openai_content(terminal_remainder)
+                                            if remainder_content:
+                                                content_buffer += remainder_content
+                                                full_response += remainder_content
+                                            yield emit_data(terminal_remainder, ensure_ascii=False)
+                                        finish_status = "terminal_tool"
+                                        await _close_upstream_stream(
+                                            response=response,
+                                            client=client,
+                                            deps=deps,
+                                            trace_prefix=trace_prefix,
+                                            label="terminal_tool",
+                                            reason="openai_chat_terminal_tool",
+                                            started_at=request_t0,
+                                            line_count=line_count,
+                                            data_line_count=data_line_count,
+                                            out_chars=len(full_response),
+                                            reader_task=reader_task,
+                                        )
+                                        stop_chunk = _build_openai_chunk(
+                                            stream_id=last_chunk_id,
+                                            created=last_chunk_created,
+                                            model=last_chunk_model,
+                                            finish_reason="stop",
+                                        )
+                                        yield emit_data(stop_chunk)
+                                        yield emit_done()
+                                        persist_stream_log("[TERMINAL_TOOL by proxy]")
+                                        return
+                                    if tool_decision.defer:
+                                        continue
+                                    for pending_line in pending_tool_lines:
+                                        yield emit_line(pending_line)
+                                    pending_tool_lines.clear()
+                                    continue
+                                if pending_tool_lines:
+                                    for pending_line in pending_tool_lines:
+                                        yield emit_line(pending_line)
+                                    pending_tool_lines.clear()
+
+                                content = _extract_openai_content(data)
 
                                 if content:
                                     content_buffer += content
@@ -836,6 +940,13 @@ async def forward_chat_completions_stream(
                                             out_chars=len(full_response),
                                             reader_task=reader_task,
                                         )
+                                        stop_chunk = _build_openai_chunk(
+                                            stream_id=last_chunk_id,
+                                            created=last_chunk_created,
+                                            model=last_chunk_model,
+                                            finish_reason="stop",
+                                        )
+                                        yield emit_data(stop_chunk)
                                         yield emit_done()
                                         persist_stream_log("[EARLY_STOP by proxy]")
                                         return
@@ -844,14 +955,24 @@ async def forward_chat_completions_stream(
                                     finish_reason = data["choices"][0].get("finish_reason")
                                     if finish_reason:
                                         saw_finish_reason = True
-                                        finish_status = f"finish_reason:{finish_reason}"
-                                        yield emit_line(line)
-                                        append_downstream_line("")
-                                        last_downstream_emit = time.perf_counter()
-                                        yield b"\n"
+                                        finish_status = f"finish_reason_local:{finish_reason}"
+                                        choice = data["choices"][0]
+                                        delta = choice.get("delta")
+                                        if isinstance(delta, dict) and delta:
+                                            content_chunk = json.loads(json.dumps(data))
+                                            content_chunk["choices"][0]["finish_reason"] = None
+                                            yield emit_data(content_chunk, ensure_ascii=False)
+                                        stop_chunk = _build_openai_chunk(
+                                            stream_id=last_chunk_id,
+                                            created=last_chunk_created,
+                                            model=last_chunk_model,
+                                            finish_reason=str(finish_reason),
+                                            usage=data.get("usage") if isinstance(data.get("usage"), dict) else None,
+                                        )
+                                        yield emit_data(stop_chunk)
                                         yield emit_done()
                                         deps.log(
-                                            f"{trace_prefix}finish_reason_emit reason={finish_reason} "
+                                            f"{trace_prefix}finish_reason_local_emit reason={finish_reason} "
                                             f"up_data_lines={data_line_count} up_out_chars={len(full_response)} "
                                             f"down_data_lines={downstream_data_count} "
                                             f"down_out_chars={downstream_content_chars} "
@@ -866,8 +987,18 @@ async def forward_chat_completions_stream(
 
                     yield emit_line(line)
 
+                for pending_line in pending_tool_lines:
+                    yield emit_line(pending_line)
+                pending_tool_lines.clear()
                 persist_stream_log("[STREAM_END: no finish_reason detected]")
                 if (upstream_aborted_event or full_response) and not saw_finish_reason and not saw_done:
+                    stop_chunk = _build_openai_chunk(
+                        stream_id=last_chunk_id,
+                        created=last_chunk_created,
+                        model=last_chunk_model,
+                        finish_reason="stop",
+                    )
+                    yield emit_data(stop_chunk)
                     yield emit_done()
                     finish_status = "stream_end_without_finish_reason"
                 else:
@@ -875,6 +1006,12 @@ async def forward_chat_completions_stream(
                         "upstream_aborted_stream_end"
                         if upstream_aborted_event else "stream_end_no_finish_reason"
                     )
+                    yield deps.build_openai_sse_error(
+                        502,
+                        "OpenAI upstream stream closed without a terminal event",
+                        "upstream_stream_incomplete",
+                    )
+                    yield emit_done()
                 deps.log(f"Stream ended without finish_reason, response_len={len(full_response)}")
             finally:
                 if not reader_task.done():
@@ -889,6 +1026,18 @@ async def forward_chat_completions_stream(
             finally:
                 await client.aclose()
 
+    except StreamSuperseded:
+        if upstream_task is not None and not upstream_task.done():
+            upstream_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await upstream_task
+        deps.log(
+            f"{trace_prefix}local_stream_superseded model={model or '-'} "
+            f"caller={caller_key or '-'}"
+        )
+        persist_stream_log("[SUPERSEDED: newer local stream replaced this request]")
+        finish_status = "local_stream_superseded"
+        return
     except asyncio.CancelledError:
         if upstream_task is not None and not upstream_task.done():
             upstream_task.cancel()
@@ -950,6 +1099,7 @@ async def collect_chat_completions_nonstream(
     """Collect a plain OpenAI-compatible non-stream chat completion."""
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
     request_t0 = time.perf_counter()
+    enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     payload = request_data.copy()
     payload["stream"] = False
 
@@ -959,6 +1109,7 @@ async def collect_chat_completions_nonstream(
         response = await client.post(url, json=payload, headers=headers)
         deps.log(
             f"{trace_prefix}nonstream_upstream_response status={response.status_code} "
+            f"{format_account_pool_route(response)} "
             f"elapsed={deps.fmt_ms(upstream_t0)}"
         )
         raw_text = response.text
@@ -1003,6 +1154,7 @@ async def replay_chat_completions_nonstream_as_stream(
     """
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
+    enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     payload = request_data.copy()
     payload["stream"] = False
     stream_id = f"chatcmpl-nonstream-replay-{uuid.uuid4().hex[:16]}"
@@ -1072,7 +1224,8 @@ async def replay_chat_completions_nonstream_as_stream(
             response = await client.post(url, json=payload, headers=headers)
             deps.log(
                 f"{trace_prefix}nonstream_replay_upstream_response "
-                f"status={response.status_code} elapsed={deps.fmt_ms(upstream_t0)}"
+                f"status={response.status_code} {format_account_pool_route(response)} "
+                f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
             text = response.text
             if response.status_code != 200:
@@ -1116,6 +1269,24 @@ async def replay_chat_completions_nonstream_as_stream(
         finish_reason = _extract_openai_finish_reason(data) or "stop"
         reasoning = _extract_openai_message_reasoning(data)
         full_content = _extract_openai_message_content(data)
+        choices = data.get("choices") if isinstance(data, dict) else None
+        message = (
+            choices[0].get("message")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            else None
+        )
+        raw_tool_calls = message.get("tool_calls", []) if isinstance(message, dict) else []
+        ordinary_tool_calls: list[dict[str, Any]] = []
+        terminal_tool_seen = False
+        for tool_call in raw_tool_calls or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            if name == TERMINAL_TOOL_NAME:
+                terminal_tool_seen = True
+            else:
+                ordinary_tool_calls.append(tool_call)
 
         if reasoning:
             yield emit_data(make_chunk(delta={"reasoning_content": reasoning}))
@@ -1125,9 +1296,17 @@ async def replay_chat_completions_nonstream_as_stream(
             for idx in range(0, len(full_content), step):
                 yield emit_data(make_chunk(delta={"content": full_content[idx:idx + step]}))
 
+        if ordinary_tool_calls:
+            yield emit_data(make_chunk(delta={"tool_calls": ordinary_tool_calls}))
+            finish_reason = "tool_calls"
+        elif terminal_tool_seen:
+            finish_reason = "stop"
+            finish_status = "terminal_tool_nonstream_replay"
+
         yield emit_data(make_chunk(finish_reason=finish_reason, usage_obj=usage or None))
         yield emit_done()
-        finish_status = f"finish_reason:{finish_reason}"
+        if finish_status != "terminal_tool_nonstream_replay":
+            finish_status = f"finish_reason:{finish_reason}"
         persist_log(f"[NONSTREAM_REPLAY_FINISH_REASON: {finish_reason}]")
     except asyncio.CancelledError:
         if upstream_task is not None and not upstream_task.done():
@@ -1179,6 +1358,7 @@ async def collect_chat_completions_stream(
     data_line_count = 0
     first_data_time: float | None = None
 
+    enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     request_data = request_data.copy()
     request_data["stream"] = True
 
@@ -1186,10 +1366,15 @@ async def collect_chat_completions_stream(
         deps.log(f"{trace_prefix}collect_request_start elapsed={deps.fmt_ms(request_t0)}")
         upstream_t0 = time.perf_counter()
         async with client.stream("POST", url, json=request_data, headers=headers) as response:
+            deps = scope_stop_detection(deps, response, url, trace_prefix)
             deps.log(
                 f"{trace_prefix}collect_upstream_headers status={response.status_code} "
+                f"{format_account_pool_route(response)} "
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
+            if is_himodels_upstream(response, url):
+                enable_early_stop = True
+                deps.log(f"{trace_prefix}himodels_early_stop=runtime_config")
             if response.status_code != 200:
                 content = await response.aread()
                 error_text = content.decode(errors="replace")
@@ -1257,8 +1442,13 @@ async def collect_chat_completions_stream(
                         choice = data["choices"][0]
 
                         delta = choice.get("delta", {})
-                        if "content" in delta:
-                            full_content += delta["content"]
+                        delta_content = (
+                            _coerce_openai_text_content(delta.get("content"))
+                            if isinstance(delta, dict)
+                            else ""
+                        )
+                        if delta_content:
+                            full_content += delta_content
                             if enable_early_stop and deps.has_stop_tag(full_content):
                                 deps.log("Collect: detected STOP_TAG")
                                 full_content = full_content[:deps.find_stop_tag(full_content)]
@@ -1278,8 +1468,13 @@ async def collect_chat_completions_stream(
                                 break
 
                         message = choice.get("message", {})
-                        if "content" in message and message["content"]:
-                            full_content += message["content"]
+                        message_content = (
+                            _coerce_openai_text_content(message.get("content"))
+                            if isinstance(message, dict)
+                            else ""
+                        )
+                        if message_content:
+                            full_content += message_content
                             if enable_early_stop and deps.has_stop_tag(full_content):
                                 full_content = full_content[:deps.find_stop_tag(full_content)]
                                 finish_reason = "stop"
