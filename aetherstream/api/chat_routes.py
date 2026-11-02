@@ -45,7 +45,12 @@ def _is_pioneer_auto_model(model: Any) -> bool:
 
 
 def _claude_nonstream_to_stream_enabled(deps: RouteDependencies) -> bool:
-    return coerce_bool(deps._runtime_lookup('claude', 'stream', 'nonstream_to_stream'), True)
+    # Legacy endpoint adapters do not own another global conversion switch.
+    # When bound, use the same explicit request policy as the managed gateway;
+    # otherwise a non-stream caller stays non-stream.
+    from aetherstream.routing.channel_policy import current_policy
+    from aetherstream.streaming.modes import upstream_stream_mode
+    return upstream_stream_mode(current_policy() or {}, False)
 
 
 async def _run_claude_nonstream_once(
@@ -177,6 +182,9 @@ def _apply_configured_template_thinking(payload: dict[str, Any], route: dict[str
 
 
 async def chat_completions(request: Request, deps: RouteDependencies):
+    if getattr(deps, 'account_routing_enabled', lambda: False)():
+        from aetherstream.api.channel_gateway import chat_completions as managed_chat
+        return await managed_chat(request, deps)
     data = None
     inbound_request = None
     inbound_structure = None
@@ -1724,6 +1732,7 @@ async def chat_completions(request: Request, deps: RouteDependencies):
 
 
 CHAT_DEPENDENCY_NAMES = (
+    'account_routing_enabled', 'resolve_account_route', 'build_account_dedupe',
     'CLAUDE_DEFAULT_MAX_TOKENS',
     'RESPONSES_API_KEY',
     'RESPONSES_BASE_URL',
@@ -1789,6 +1798,7 @@ CHAT_DEPENDENCY_NAMES = (
     'is_claude_sonnet_model',
     'log',
     'model_policy',
+    'normal_completion_guard',
     'parse_claude_provider_prefix',
     'parse_free_provider_prefix',
     'release_active_stream_caller',
@@ -1813,19 +1823,9 @@ def register_routes(app, ctx: dict[str, Any]) -> RouteDependencies:
     nonstream_keepalive_interval = float(ctx.get('NONSTREAM_KEEPALIVE_INTERVAL', 10.0))
 
     async def chat_completions_endpoint(request: Request):
-        try:
-            payload = await request.json()
-        except Exception:
-            return await chat_completions(request, deps)
-
-        if not isinstance(payload, dict) or payload.get('stream', False):
-            return await chat_completions(request, deps)
-
-        return keepalive_json_response(
-            lambda: chat_completions(request, deps),
-            interval=nonstream_keepalive_interval,
-            trace_id=getattr(request.state, 'trace_id', ''),
-            log=deps.log,
+        from aetherstream.api.request_entry import protocol_entry
+        return await protocol_entry(
+            request, deps, lambda: chat_completions(request, deps), interval=nonstream_keepalive_interval,
         )
 
     app.post('/v1/chat/completions')(chat_completions_endpoint)

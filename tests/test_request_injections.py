@@ -10,6 +10,8 @@ from aetherstream.features.opus_notes import (
     PRO_OPUS_LAST_USER_APPEND_MARKER,
     PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
     PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
+    PRO_OPUS_LAST_USER_ILLUSTRATION_ONLY_MARKER,
+    PRO_OPUS_LAST_USER_ILLUSTRATION_ONLY_TEXT,
 )
 from aetherstream.features.request_injections import (
     ASSISTANT_PREFILL_CONTINUATION_TEXT,
@@ -22,10 +24,120 @@ from aetherstream.features.request_injections import (
 
 
 class RequestInjectionTests(unittest.TestCase):
-    def test_illustration_only_reminder_exact_wording(self):
-        reminder = '（记得插图。）'
+    def test_channel_can_disable_math_without_disabling_illustration_or_stage(self):
+        from aetherstream.api.channel_gateway import apply_request_policy
+
+        policy = {'injections': {'opus_note': True, 'illustration': True, 'math_reminder': False}}
+        for stream in (False, True):
+            for human in ('hello', '<latest_human_message>hello</latest_human_message>'):
+                with self.subTest(stream=stream, human=human):
+                    request = {'model': '[AWSB]claude-opus-4-6', 'stream': stream,
+                               'messages': [{'role': 'user', 'content': human}]}
+                    original = copy.deepcopy(request)
+                    output = apply_request_policy(request, policy, SimpleNamespace(log=lambda _: None), trace_id='test')
+                    body = output['messages'][0]['content']
+                    self.assertEqual(request, original)
+                    self.assertEqual(body.count(PRO_OPUS_LAST_USER_ILLUSTRATION_ONLY_MARKER), 3)
+                    self.assertIn(PRO_OPUS_LAST_USER_ILLUSTRATION_ONLY_TEXT, body)
+                    self.assertEqual(body.count(PRO_OPUS_LAST_USER_APPEND_MARKER), 1)
+                    self.assertNotIn('<math>', body)
+                    self.assertNotIn('高数题', body)
+                    self.assertEqual(apply_request_policy(output, policy, SimpleNamespace(log=lambda _: None), trace_id='test'), output)
+
+    def test_disabling_injected_math_preserves_caller_math_and_unrelated_messages(self):
+        from aetherstream.api.channel_gateway import apply_request_policy
+
+        original_math = '<further_mathematics><math>用户自己的数学要求</math></further_mathematics>'
+        request = {'model': '[AWSB]claude-opus-4-6', 'messages': [
+            {'role': 'system', 'content': original_math},
+            {'role': 'user', 'content': '<latest_human_message>hello</latest_human_message>\n' + original_math},
+        ]}
+        original = copy.deepcopy(request)
+        output = apply_request_policy(request, {'injections': {'opus_note': True, 'math_reminder': False}},
+                                      SimpleNamespace(log=lambda _: None), trace_id='test')
+        self.assertEqual(request, original)
+        self.assertEqual(output['messages'][0], original['messages'][0])
+        self.assertEqual(output['messages'][1]['content'].count(original_math), 1)
+        self.assertEqual(output['messages'][1]['content'].count('<math>'), 1)
+        self.assertNotIn('高数题', output['messages'][1]['content'])
+
+    def test_illustration_math_reminder_exact_wording(self):
+        reminder = '(记得插图；正文及所有变量更新完成后，记得按要求在整个回复的最末尾输出以 <math> 和 </math> 包裹的高数题、解题思路及详细步骤。)'
         self.assertEqual(PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER, reminder)
         self.assertEqual(PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT, '!!important!!\n' + reminder * 3 + '\n!!important!!')
+        self.assertEqual(PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT.count('<math>'), 3)
+        self.assertEqual(PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT.count('</math>'), 3)
+
+    def test_illustration_reminder_keeps_placement_and_user_math_instruction(self):
+        instruction = '<further_mathematics><math>用户自备的完整数学要求</math></further_mathematics>'
+        request = {'messages': [{'role': 'user', 'content':
+            '<latest_human_message>hello</latest_human_message>\n' + instruction}]}
+        kwargs = dict(selected_model='claude-opus-5-5-aws', trace_prefix='[TRACE test]',
+                      route_label='configured', is_opus_model=lambda _: True, log=lambda _: None)
+        apply_direct_opus_note(request, **kwargs)
+        first = copy.deepcopy(request)
+        apply_direct_opus_note(request, **kwargs)
+        self.assertEqual(request, first)
+        content = request['messages'][0]['content']
+        self.assertIn('</latest_human_message>\n\n' + PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT, content)
+        self.assertEqual(content.count(PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER), 3)
+        self.assertEqual(content.count('<math>'), 4)
+        self.assertEqual(content.count('</math>'), 4)
+        self.assertEqual(content.count(instruction), 1)
+        self.assertEqual(content.count('高数题'), 3)
+        self.assertEqual(content.count(PRO_OPUS_LAST_USER_APPEND_MARKER), 1)
+
+    def test_channel_math_reminder_preserves_original_request_and_options(self):
+        from aetherstream.api.channel_gateway import apply_request_policy
+
+        policy = {'injections': {'opus_note': True, 'illustration': True},
+                  'early_stop': {'enabled': True, 'tags': ['<math>']}}
+        deps = SimpleNamespace(log=lambda _: None)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                request = {'model': 'free/claude-opus-5-5', 'stream': stream,
+                           'max_tokens': 30000, 'temperature': 1,
+                           'messages': [
+                               {'role': 'system', 'content': '<further_mathematics>用户自备的完整要求</further_mathematics>'},
+                               {'role': 'user', 'content': '<latest_human_message>hello</latest_human_message>'},
+                           ]}
+                original = copy.deepcopy(request)
+                before_policy = copy.deepcopy(policy)
+                output = apply_request_policy(request, policy, deps, trace_id='test')
+                self.assertEqual(request, original)
+                self.assertEqual(policy, before_policy)
+                self.assertEqual(output['messages'][0], original['messages'][0])
+                for key in ('model', 'stream', 'max_tokens', 'temperature'):
+                    self.assertEqual(output[key], original[key])
+                content = output['messages'][1]['content']
+                self.assertIn('</latest_human_message>\n\n' + PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT, content)
+                self.assertEqual(content.count(PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER), 3)
+                self.assertEqual(content.count(PRO_OPUS_LAST_USER_APPEND_MARKER), 1)
+                self.assertEqual(apply_request_policy(output, policy, deps, trace_id='test'), output)
+
+    def test_channel_math_reminder_respects_existing_injection_gates(self):
+        from aetherstream.api.channel_gateway import apply_request_policy
+
+        request = {'model': 'free/claude-opus-5-5', 'messages': [{'role': 'user', 'content': 'hello'}]}
+        deps = SimpleNamespace(log=lambda _: None)
+        for injections in ({'opus_note': False}, {'opus_note': True, 'illustration': False}):
+            with self.subTest(injections=injections):
+                output = apply_request_policy(request, {'injections': injections}, deps, trace_id='test')
+                content = output['messages'][0]['content']
+                self.assertNotIn('记得插图', content)
+                self.assertNotIn('<math>', content)
+                self.assertEqual(PRO_OPUS_LAST_USER_APPEND_MARKER in content, injections['opus_note'])
+
+    def test_illustration_reminder_obeys_existing_illustration_switch(self):
+        request = {'messages': [{'role': 'user', 'content': 'hello'}]}
+        apply_pioneer_opus_note(
+            request, selected_model='claude-opus-5-5-aws', trace_prefix='[TRACE test]',
+            route_label='configured', runtime_lookup=lambda *keys: keys[-1] != 'illustration_enabled',
+            is_opus_model=lambda _: True, log=lambda _: None)
+        content = request['messages'][0]['content']
+        self.assertNotIn('记得插图', content)
+        self.assertNotIn('<math>', content)
+        self.assertIn(PRO_OPUS_LAST_USER_APPEND_MARKER, content)
 
     def test_kimi_model_matches_provider_prefixes_only(self):
         for model in ('kimi-k3', 'free/kimi-k3', '[NV]kimi-k3', '[G]Kimi-2.7-code',
@@ -198,6 +310,18 @@ class KimiRouteInjectionTests(unittest.IsolatedAsyncioTestCase):
                     captured.append(kwargs['request_data'])
                     return ('ok', model, {}, 'stop', '')
 
+                async def fake_json_collect(**kwargs):
+                    captured.append(kwargs['request_data'])
+                    value = {'id': 'offline', 'object': 'chat.completion', 'model': model,
+                             'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}],
+                             'usage': {}}
+                    return ('ok', model, {}, 'stop', json.dumps(value), value)
+
+                async def run_once(**kwargs):
+                    return await kwargs['runner'](), False
+
+                deps.collect_chat_completions_nonstream = fake_json_collect
+                deps.run_exact_nonstream_once = run_once
                 deps.forward_chat_completions_stream = fake_stream
                 deps.collect_chat_completions_stream = fake_collect
                 stage = '<stage><act name="测试角色">now: 示例</act></stage>'

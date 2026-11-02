@@ -15,17 +15,9 @@ def register_routes(app, ctx: dict[str, Any]) -> RouteDependencies:
     nonstream_keepalive_interval = float(ctx.get("NONSTREAM_KEEPALIVE_INTERVAL", 10.0))
 
     async def responses_endpoint(request: Request):
-        try:
-            payload = await request.json()
-        except Exception:
-            return await route_protocol_request(request, chat_deps, protocol="responses")
-        if not isinstance(payload, dict) or payload.get("stream", False):
-            return await route_protocol_request(request, chat_deps, protocol="responses")
-        return keepalive_json_response(
-            lambda: route_protocol_request(request, chat_deps, protocol="responses"),
-            interval=nonstream_keepalive_interval,
-            trace_id=getattr(request.state, "trace_id", ""),
-            log=chat_deps.log,
+        from aetherstream.api.request_entry import protocol_entry
+        return await protocol_entry(
+            request, chat_deps, lambda: route_protocol_request(request, chat_deps, protocol="responses"), interval=nonstream_keepalive_interval,
         )
 
     app.post("/v1/responses")(responses_endpoint)

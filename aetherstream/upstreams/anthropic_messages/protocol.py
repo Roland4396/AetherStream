@@ -17,7 +17,22 @@ def _append_raw_line(
 
 
 def _extract_anthropic_sse_delta(data: dict[str, Any]) -> tuple[str, str]:
-    if data.get("type") != "content_block_delta":
+    # Compatible gateways can put the first visible text in either start
+    # event, not only text_delta. Feed all three through the same consumer so
+    # a stop at offset zero (or spanning start/delta) closes the upstream too.
+    event_type = data.get("type")
+    if event_type == "message_start":
+        message = data.get("message")
+        if isinstance(message, dict):
+            return _extract_text_from_message_content(message.get("content")), "content"
+        return "", ""
+    if event_type == "content_block_start":
+        block = data.get("content_block")
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            return (text if isinstance(text, str) else ""), "content"
+        return "", ""
+    if event_type != "content_block_delta":
         return "", ""
     delta = data.get("delta")
     if not isinstance(delta, dict):
@@ -60,13 +75,12 @@ def _normalize_usage(usage: dict[str, Any] | None, base: dict[str, Any] | None =
 
     prompt_tokens = int(merged.get("input_tokens") or 0)
     completion_tokens = int(merged.get("output_tokens") or 0)
-    total_tokens = int(merged.get("total_tokens") or (prompt_tokens + completion_tokens))
-    normalized = {
+    total_tokens = int((usage or {}).get("total_tokens") or (prompt_tokens + completion_tokens))
+    normalized = {**merged,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
-    normalized.update(merged)
     return normalized
 
 

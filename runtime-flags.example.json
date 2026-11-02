@@ -1,70 +1,55 @@
 {
   "quota_keeper": {
-    "enabled": false,
-    "check_interval_sec": 60
+    "enabled": false
   },
-  "openai_compatible_upstreams": [
-    {
-      "name": "example-openai-compatible",
-      "base_url": "https://api.example.com/v1",
-      "api_key_env": "EXAMPLE_OPENAI_API_KEY"
-    }
-  ],
-  "claude": {
-    "stream": {
-      "header_keepalive": {
-        "enabled": false,
-        "seconds": 3
-      },
-      "idle_timeout": {
-        "enabled": false,
-        "seconds": 4
-      },
-      "nonstream_to_stream": true
-    },
-    "prompt_caching": {
-      "enabled": false,
-      "type": "ephemeral",
-      "ttl": "",
-      "mode": "explicit",
-      "keepalive": {
-        "enabled": false,
-        "interval_sec": 240,
-        "max_tokens": 1,
-        "first_data_timeout_sec": 60,
-        "max_runs": 5,
-        "post_delay_sec": 240
-      }
-    },
-    "output_config": {
-      "effort": ""
-    },
-    "client_compat": {
-      "thinking": {
-        "type": "disabled"
-      },
-      "tools": {
-        "enabled": true
-      },
-      "context_management": {
-        "enabled": false,
-        "edits": []
-      }
-    },
-    "keyword_filter": {
-      "enabled": false,
-      "keywords": []
-    },
-    "session": {
-      "ttl_sec": 1800
-    }
+  "account_routing": {
+    "enabled": false,
+    "base_url": "http://account-pool-proxy:3200",
+    "api_key": "replace-with-local-service-key"
   },
   "early_stop": {
     "enabled": false,
-    "tags": [
-      "<disclaimer>",
-      "<closing_leaf>"
-    ],
+    "action": "disconnect",
+    "tags": [],
     "case_sensitive": true
+  },
+  "streaming": {
+    "json_keepalive": true,
+    "exact_dedupe": false,
+    "deadline_seconds": 0
+  },
+  "claude": {},
+  "injections": {
+    "gemini_anti_route": {
+      "enabled": false,
+      "mode": "deep",
+      "headCommentMin": 18,
+      "headCommentMax": 38,
+      "turnCommentMin": 8,
+      "turnCommentMax": 22,
+      "charMin": 16,
+      "charMax": 42,
+      "input_transform": {
+        "enabled": false,
+        "mode": "pinyin",
+        "tone": "symbol",
+        "ratio": 40,
+        "languages": [
+          "en"
+        ],
+        "wrapper": true,
+        "padding_chars": 32,
+        "preserve_terms": []
+      }
+    }
+  },
+  "filters": {},
+  "channel_policies": {
+    "schema": 1,
+    "defaults": {},
+    "profiles": {},
+    "model_rules": [],
+    "channels": {},
+    "account_overrides": {}
   }
 }

@@ -66,57 +66,7 @@ def _is_async_generator_close_race(exc: BaseException) -> bool:
     )
 
 
-async def _close_upstream_stream(
-    *,
-    response: httpx.Response | None,
-    client: httpx.AsyncClient | None,
-    deps: "AnthropicMessagesDeps",
-    trace_prefix: str,
-    label: str,
-    reason: str,
-    started_at: float,
-    line_count: int,
-    data_line_count: int,
-    out_chars: int,
-    reader_task: asyncio.Task | None = None,
-) -> None:
-    close_t0 = time.perf_counter()
-    if reader_task is not None and not reader_task.done():
-        reader_task.cancel()
-        try:
-            await reader_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-
-    response_closed = False
-    client_closed = False
-    if response is not None:
-        try:
-            await response.aclose()
-            response_closed = True
-        except Exception as e:
-            deps.log(
-                f"{trace_prefix}{label}_upstream_close_response_error "
-                f"reason={reason} type={type(e).__name__} err={e}"
-            )
-    if client is not None:
-        try:
-            await client.aclose()
-            client_closed = True
-        except Exception as e:
-            deps.log(
-                f"{trace_prefix}{label}_upstream_close_client_error "
-                f"reason={reason} type={type(e).__name__} err={e}"
-            )
-    deps.log(
-        f"{trace_prefix}{label}_upstream_close "
-        f"reason={reason} response_closed={str(response_closed).lower()} "
-        f"client_closed={str(client_closed).lower()} close_elapsed={deps.fmt_ms(close_t0)} "
-        f"elapsed={deps.fmt_ms(started_at)} lines={line_count} "
-        f"data_lines={data_line_count} out_chars={out_chars}"
-    )
+from aetherstream.streaming.upstream_close import close_upstream_stream as _close_upstream_stream
 
 
 def _build_code_cli_prime_url(url: str) -> str | None:

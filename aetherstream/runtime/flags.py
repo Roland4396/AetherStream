@@ -1,10 +1,23 @@
 """Hot-reloaded runtime flag file support."""
 
+import fcntl
 import json
 import os
 import time
 from collections.abc import Callable
 from typing import Any
+
+
+def read_flags(path: str) -> tuple[dict, bytes, os.stat_result]:
+    """Coherent snapshot shared with the narrowly scoped admin writer."""
+    with open(path, 'rb') as file:
+        fcntl.flock(file, fcntl.LOCK_SH)
+        raw = file.read()
+        stat = os.fstat(file.fileno())
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError('Runtime flags must be an object')
+    return value, raw, stat
 
 
 class RuntimeFlags:
@@ -55,12 +68,9 @@ class RuntimeFlags:
             return self._cache
 
         try:
-            with open(self.path, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-            if not isinstance(loaded, dict):
-                raise ValueError('top-level JSON must be an object')
+            loaded, _, locked_stat = read_flags(self.path)
             self._cache = loaded
-            self._cache_mtime = stat.st_mtime
+            self._cache_mtime = locked_stat.st_mtime
             self._error_state = None
             self._log(f'Runtime flags loaded from {self.path}')
             return self._cache
@@ -72,6 +82,10 @@ class RuntimeFlags:
             if isinstance(self._cache, dict):
                 return self._cache
             return {}
+
+    def invalidate(self) -> None:
+        self._checked_at = 0.0
+        self._cache_mtime = None
 
     def lookup(self, *keys: str) -> Any:
         current: Any = self.load()

@@ -5,6 +5,7 @@ from filelock import FileLock
 import json
 import os
 import re
+import stat
 import threading
 import time
 from collections.abc import Callable
@@ -398,12 +399,35 @@ class ReplayStore:
 
     def write_control(self, control: dict[str, object]) -> None:
         with self._control_lock:
-            os.makedirs(os.path.dirname(self.control_file), exist_ok=True)
+            directory = os.path.dirname(self.control_file) or '.'
+            os.makedirs(directory, exist_ok=True)
+            try:
+                existing = os.stat(self.control_file)
+            except FileNotFoundError:
+                existing = None
+            owner = existing if existing is not None else os.stat(directory)
             temp_path = f'{self.control_file}.tmp-{os.getpid()}-{int(time.time() * 1000)}'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(control, f, ensure_ascii=False, indent=2)
-                f.write('\n')
-            os.replace(temp_path, self.control_file)
+            temp_created = False
+            try:
+                with open(temp_path, 'x', encoding='utf-8') as f:
+                    temp_created = True
+                    json.dump(control, f, ensure_ascii=False, indent=2)
+                    f.write('\n')
+                    # Atomic replacement must not transfer a host-owned control
+                    # file to the container's root user. New files inherit the
+                    # directory owner; existing files retain owner and mode.
+                    current = os.fstat(f.fileno())
+                    if (current.st_uid, current.st_gid) != (owner.st_uid, owner.st_gid):
+                        os.fchown(f.fileno(), owner.st_uid, owner.st_gid)
+                    if existing is not None:
+                        os.fchmod(f.fileno(), stat.S_IMODE(existing.st_mode))
+                os.replace(temp_path, self.control_file)
+            finally:
+                if temp_created:
+                    try:
+                        os.unlink(temp_path)
+                    except FileNotFoundError:
+                        pass
 
 
 # Keep imports used by existing deployments and extensions working.

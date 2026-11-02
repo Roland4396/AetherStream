@@ -11,6 +11,8 @@ from aetherstream.features.opus_notes import (
     PRO_OPUS_LAST_USER_APPEND_TEXT,
     PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
     PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
+    PRO_OPUS_LAST_USER_ILLUSTRATION_ONLY_MARKER,
+    PRO_OPUS_LAST_USER_ILLUSTRATION_ONLY_TEXT,
 )
 from aetherstream.transforms.requests import (
     append_to_last_user_message,
@@ -83,28 +85,34 @@ def _apply_opus_note(
     illustration_enabled: bool,
     log_prefix: str,
     log_context: str = '',
+    math_enabled: bool = True,
 ) -> None:
     messages = request_data.get('messages', [])
     feature_prefix = f'{log_prefix}_' if log_prefix else ''
     context_suffix = f' {log_context.strip()}' if log_context.strip() else ''
     if illustration_enabled:
+        illustration_text = (PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT if math_enabled
+                             else PRO_OPUS_LAST_USER_ILLUSTRATION_ONLY_TEXT)
+        illustration_marker = (PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER if math_enabled
+                               else PRO_OPUS_LAST_USER_ILLUSTRATION_ONLY_MARKER)
         illustrated = insert_after_latest_human_message(
             messages,
-            PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
-            PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
+            illustration_text,
+            illustration_marker,
         )
         placement = 'latest_human_message'
         if not illustrated:
             illustrated = append_to_last_user_message(
                 messages,
-                PRO_OPUS_LAST_USER_ILLUSTRATION_TEXT,
-                PRO_OPUS_LAST_USER_ILLUSTRATION_MARKER,
+                illustration_text,
+                illustration_marker,
             )
             placement = 'last_user_fallback'
         action = 'inserted' if illustrated else 'skipped'
         log(
             f"{trace_prefix} {route_label}_{feature_prefix}latest_human_illustration "
-            f"{action} placement={placement} model={selected_model}{context_suffix}"
+            f"{action} placement={placement} math_reminder={str(math_enabled).lower()} "
+            f"model={selected_model}{context_suffix}"
         )
     else:
         log(

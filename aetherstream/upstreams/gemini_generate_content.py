@@ -3,13 +3,14 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable
 from urllib.parse import urlsplit
 
 import httpx
 
 from aetherstream.upstreams.route_logging import format_account_pool_route
+from aetherstream.features.gemini_anti_route import GeminiAntiRouteSession, apply_gemini_anti_route
 
 from aetherstream.features.terminal_tool import (
     TERMINAL_TOOL_NAME,
@@ -26,6 +27,7 @@ class GeminiGenerateContentConfig:
     max_retries: int
     retry_delay: float
     timeout: httpx.Timeout
+    extra_headers: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -33,6 +35,8 @@ class GeminiGenerateContentDeps:
     log: Callable[[str], None]
     save_request_log: Callable[..., None]
     build_openai_sse_error: Callable[[int, str, str], bytes]
+    runtime_lookup: Callable[..., Any] | None = None
+    gemini_anti_route: GeminiAntiRouteSession = field(default_factory=GeminiAntiRouteSession)
 
 
 def _fmt_elapsed_ms(start: float, end: float | None = None) -> str:
@@ -79,6 +83,7 @@ def _build_gemini_headers(model: str, config: GeminiGenerateContentConfig) -> di
         "Content-Type": "application/json",
         "x-goog-api-key": config.api_key,
         "User-Agent": f"StreamProxy/1.0 Gemini/{model}",
+        **config.extra_headers,
     }
 
 
@@ -262,6 +267,8 @@ async def _request_gemini_generate_content(
     trace_id: str,
 ) -> dict:
     """All native Gemini requests use generateContent, never streamGenerateContent."""
+    apply_gemini_anti_route(openai_request, deps, model=model,
+                           trace_prefix=f'[TRACE {trace_id}] ' if trace_id else '', native_transport=True)
     payload = _convert_openai_to_gemini(
         openai_request, include_thoughts=config.include_thoughts,
     )

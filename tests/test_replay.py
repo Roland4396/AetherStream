@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -151,6 +153,59 @@ class ReplayStoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_control_replace_preserves_mode_and_current_owner(self):
+        self.control_path.write_text('{}', encoding='utf-8')
+        self.control_path.chmod(0o640)
+        before = self.control_path.stat()
+        with patch('aetherstream.features.claude_replay.os.fchown') as chown:
+            self.store.write_control({'enabled': False})
+        after = self.control_path.stat()
+        self.assertEqual((after.st_uid, after.st_gid), (before.st_uid, before.st_gid))
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o640)
+        chown.assert_not_called()
+        self.assertEqual(json.loads(self.control_path.read_text()), {'enabled': False})
+
+    @unittest.skipUnless(os.geteuid() == 0, 'root needed to simulate container/host ownership')
+    def test_root_writer_preserves_nonroot_control_owner(self):
+        self.control_path.write_text('{}', encoding='utf-8')
+        os.chown(self.control_path, 1000, 1001)
+        self.control_path.chmod(0o600)
+        self.store.write_control({'enabled': False})
+        after = self.control_path.stat()
+        self.assertEqual((after.st_uid, after.st_gid), (1000, 1001))
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o600)
+
+    @unittest.skipUnless(os.geteuid() == 0, 'root needed to simulate container/host ownership')
+    def test_new_control_inherits_directory_owner(self):
+        os.chown(self.log_dir, 1000, 1001)
+        self.store.write_control({'enabled': False})
+        after = self.control_path.stat()
+        self.assertEqual((after.st_uid, after.st_gid), (1000, 1001))
+
+    @unittest.skipUnless(os.geteuid() == 0, 'root needed to simulate container/host ownership')
+    def test_once_consumption_retains_host_owner(self):
+        os.chown(self.log_dir, 1000, 1001)
+        self.store.write_control({
+            'enabled': True, 'mode': 'once', 'match_request': False,
+            'raw_sse_path': '01_raw_sse.txt',
+        })
+        spec = self.store.lookup(model='any', messages=[])['spec']
+        self.assertTrue(self.store.consume_if_needed(spec))
+        after = self.control_path.stat()
+        self.assertEqual((after.st_uid, after.st_gid), (1000, 1001))
+        self.assertFalse(self.store.read_control()['enabled'])
+
+    @unittest.skipUnless(os.geteuid() == 0, 'root needed to simulate container/host ownership')
+    def test_owner_failure_keeps_original_control_and_cleans_temp(self):
+        original = '{"enabled":true}'
+        self.control_path.write_text(original, encoding='utf-8')
+        os.chown(self.control_path, 1000, 1001)
+        with patch('aetherstream.features.claude_replay.os.fchown', side_effect=PermissionError('test')):
+            with self.assertRaises(PermissionError):
+                self.store.write_control({'enabled': False})
+        self.assertEqual(self.control_path.read_text(), original)
+        self.assertEqual(list(self.log_dir.glob('replay.json.tmp-*')), [])
 
     def test_lookup_matches_original_request(self):
         self.store.write_control({

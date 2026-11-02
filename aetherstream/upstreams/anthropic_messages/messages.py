@@ -1,4 +1,5 @@
 import asyncio
+from aetherstream.routing.channel_policy import disconnect_on_early_stop
 import json
 import time
 from typing import AsyncGenerator
@@ -8,7 +9,7 @@ import httpx
 from aetherstream.observability.refusals import AnthropicRefusalDiagnostics
 
 from aetherstream.features.early_stop import is_himodels_upstream
-from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection
+from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection, upstream_early_stop_enabled
 
 from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME
 
@@ -53,9 +54,7 @@ async def forward_anthropic_messages_stream(
                     f"{format_account_pool_route(response)} "
                     f"elapsed={deps.fmt_ms(upstream_t0)}"
                 )
-                if is_himodels_upstream(response, url):
-                    enable_early_stop = True
-                    deps.log(f"{trace_prefix}himodels_early_stop=runtime_config")
+                enable_early_stop = upstream_early_stop_enabled(response, url, enable_early_stop)
                 if response.status_code != 200:
                     finish_status = f"upstream_http_{response.status_code}"
                     content = await response.aread()
@@ -155,6 +154,8 @@ async def forward_anthropic_messages_stream(
                                             data_line_count=data_line_count,
                                             out_chars=len(content_buffer),
                                         )
+                                        if disconnect_on_early_stop():
+                                            return
                                         yield b"event: message_stop\n"
                                         yield b'data: {"type":"message_stop"}\n\n'
                                         return

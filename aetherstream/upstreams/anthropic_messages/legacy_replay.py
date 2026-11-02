@@ -113,9 +113,8 @@ async def replay_anthropic_chat_stream(
                     )
                     yield f"data: {json.dumps(role_chunk, ensure_ascii=True)}\n\n".encode()
                     sent_role_chunk = True
-                continue
 
-            if event_type == "content_block_delta":
+            if event_type in {"message_start", "content_block_start", "content_block_delta"}:
                 delta = _extract_anthropic_sse_text(data)
                 if not delta:
                     continue
@@ -303,9 +302,8 @@ async def collect_anthropic_chat_completion_from_raw_sse(
             if message.get("model"):
                 model_name = str(message["model"])
             usage = _normalize_usage(message.get("usage"), usage)
-            continue
 
-        if event_type == "content_block_delta":
+        if event_type in {"message_start", "content_block_start", "content_block_delta"}:
             delta = _extract_anthropic_sse_text(data)
             if not delta:
                 continue

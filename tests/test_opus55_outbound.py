@@ -59,11 +59,19 @@ class Opus55OutboundTests(unittest.IsolatedAsyncioTestCase):
             captured.append(copy.deepcopy(kwargs['request_data']))
             return ('ok', payload['model'], {}, 'stop', '')
 
+        async def fake_json_collect(**kwargs):
+            captured.append(copy.deepcopy(kwargs['request_data']))
+            value = {'id': 'offline', 'object': 'chat.completion', 'model': payload['model'],
+                     'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}],
+                     'usage': {}}
+            return ('ok', payload['model'], {}, 'stop', json.dumps(value), value)
+
         async def fake_native_collect(**kwargs):
             return (*await fake_collect(**kwargs), [])
 
         deps.forward_chat_completions_stream = fake_stream
         deps.collect_chat_completions_stream = fake_collect
+        deps.collect_chat_completions_nonstream = fake_json_collect
         deps.forward_anthropic_messages_as_chat_stream = fake_stream
         deps.collect_anthropic_messages_as_chat_completion = fake_native_collect
         path = {'chat': '/v1/chat/completions', 'responses': '/v1/responses', 'anthropic': '/v1/messages'}[protocol]
@@ -96,9 +104,8 @@ class Opus55OutboundTests(unittest.IsolatedAsyncioTestCase):
             expected = self.inject_expected(payload)
             expected.pop('reasoning_effort')
             expected['thinking'] = {'type': 'adaptive'}
-            # Conversion defaults on here; assert the actual upstream mode,
-            # not the pre-collector client mode captured by the old stub.
-            expected['stream'] = True
+            # No hidden conversion default: actual upstream follows the caller.
+            expected['stream'] = streaming
             self.assertEqual(outgoing, expected)
             self.assertTrue(any('opus55_adaptive_compat' in line for line in logs))
             self.assertFalse(any('pro_no_reasoning_payload' in line for line in logs))
@@ -143,7 +150,7 @@ class Opus55OutboundTests(unittest.IsolatedAsyncioTestCase):
                        'thinking': {'type': 'adaptive', 'display': 'omitted'},
                        'reasoning_effort': 'high', 'output_config': {'effort': 'max'}}
             outgoing, _ = await self.capture(payload)
-            self.assertEqual(outgoing, dict(self.inject_expected(payload), stream=True))
+            self.assertEqual(outgoing, dict(self.inject_expected(payload), stream=streaming))
 
     async def test_non_pro_directory_also_gets_model_guard(self):
         payload = {'model': '[m1]claude-opus-5-5', 'stream': True,

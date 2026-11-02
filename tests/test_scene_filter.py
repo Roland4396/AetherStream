@@ -162,6 +162,18 @@ class SceneFilterProtocolTests(unittest.IsolatedAsyncioTestCase):
                         captured.append(copy.deepcopy(kwargs['request_data']))
                         return ('OK', model, {}, 'stop', '')
 
+                    async def fake_json_collect(**kwargs):
+                        captured.append(copy.deepcopy(kwargs['request_data']))
+                        value = {'id': 'offline', 'object': 'chat.completion', 'model': model,
+                                 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'OK'}, 'finish_reason': 'stop'}],
+                                 'usage': {}}
+                        return ('OK', model, {}, 'stop', json.dumps(value), value)
+
+                    async def run_once(**kwargs):
+                        return await kwargs['runner'](), False
+
+                    deps.collect_chat_completions_nonstream = fake_json_collect
+                    deps.run_exact_nonstream_once = run_once
                     deps.forward_chat_completions_stream = fake_stream
                     deps.collect_chat_completions_stream = fake_collect
                     payload = {'model': model, 'stream': stream, 'max_tokens': 64,

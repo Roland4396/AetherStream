@@ -45,47 +45,27 @@ class ExactRequestCoalescerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recent_result[1])
         self.assertEqual(recent_result[0], {"value": 1})
 
-    async def test_upstream_task_finishes_after_requester_cancellation(self):
+    async def test_last_requester_cancellation_closes_upstream_without_cache(self):
         calls = 0
-        started = asyncio.Event()
-        release = asyncio.Event()
-        coalescer = ExactRequestCoalescer(ttl=60, log=lambda _message: None)
-
+        started, closed = asyncio.Event(), asyncio.Event()
+        coalescer = ExactRequestCoalescer(ttl=60, log=lambda _: None)
         async def runner():
             nonlocal calls
             calls += 1
             started.set()
-            await release.wait()
-            return {"value": "finished"}
-
-        requester = asyncio.create_task(coalescer.run(
-            dedupe_key="cancelled-caller",
-            trace_id="first",
-            upstream_label="test",
-            runner=runner,
-        ))
+            try:
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+        requester = asyncio.create_task(coalescer.run(dedupe_key='cancelled', trace_id='one',
+                                                      upstream_label='test', runner=runner))
         await started.wait()
         requester.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await requester
-
-        release.set()
-        for _ in range(10):
-            if (await coalescer.state())["inflight"] == 0:
-                break
-            await asyncio.sleep(0)
-
-        state = await coalescer.state()
-        result, shared = await coalescer.run(
-            dedupe_key="cancelled-caller",
-            trace_id="second",
-            upstream_label="test",
-            runner=runner,
-        )
-        self.assertEqual(state, {"inflight": 0, "recent": 1})
+        self.assertTrue(closed.is_set())
+        self.assertEqual(await coalescer.state(), {'inflight': 0, 'recent': 0})
         self.assertEqual(calls, 1)
-        self.assertTrue(shared)
-        self.assertEqual(result, {"value": "finished"})
 
 
 if __name__ == "__main__":

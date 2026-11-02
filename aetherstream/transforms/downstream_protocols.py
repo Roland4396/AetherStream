@@ -7,7 +7,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from typing import Any
 
 
@@ -336,6 +336,7 @@ async def chat_stream_to_responses(
     body: AsyncIterator[Any],
     *,
     model: str,
+    strict_terminal: bool = False,
 ) -> AsyncIterator[bytes]:
     response_id = f"resp_{uuid.uuid4().hex}"
     message_id = f"msg_{uuid.uuid4().hex}"
@@ -346,6 +347,7 @@ async def chat_stream_to_responses(
     response_model = model
     usage: dict[str, Any] = {}
     tools: dict[int, dict[str, Any]] = {}
+    terminal_seen = False
     finished = False
     failed = False
     last_error: dict[str, Any] | None = None
@@ -443,134 +445,138 @@ async def chat_stream_to_responses(
 
     yield event("response.created", {"response": response_object("in_progress")})
     yield event("response.in_progress", {"response": response_object("in_progress")})
-    async for _event_name, payload in iter_sse_events(body):
-        if payload == "[DONE]":
-            if failed:
-                failed_response = response_object("failed")
-                failed_response["error"] = last_error
-                yield event("response.failed", {"response": failed_response})
+    async with aclosing(iter_sse_events(body)) as source:
+        async for _event_name, payload in source:
+            if payload == "[DONE]":
+                if failed:
+                    failed_response = response_object("failed")
+                    failed_response["error"] = last_error
+                    yield event("response.failed", {"response": failed_response})
+                    return
+                async for tail in finalize():
+                    yield tail
                 return
-            async for tail in finalize():
-                yield tail
-            return
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data.get("error"), dict):
-            failed = True
-            error = data["error"]
-            last_error = {
-                "code": error.get("type") or "upstream_error",
-                "message": error.get("message") or "Upstream error",
-            }
-            yield event("error", {
-                **last_error,
-                "param": None,
-            })
-            continue
-        if data.get("model"):
-            response_model = str(data["model"])
-        if isinstance(data.get("created"), int):
-            created_at = data["created"]
-        if isinstance(data.get("usage"), dict):
-            raw_usage = data["usage"]
-            usage = {
-                "input_tokens": int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0),
-                "output_tokens": int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0),
-                "total_tokens": int(raw_usage.get("total_tokens") or 0),
-            }
-            if not usage["total_tokens"]:
-                usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            continue
-        delta = choices[0].get("delta")
-        if not isinstance(delta, dict):
-            continue
-        content = delta.get("content")
-        emitted_payload = False
-        if isinstance(content, str) and content:
-            emitted_payload = True
-            if not text_started:
-                text_started = True
-                yield event("response.output_item.added", {
-                    "output_index": 0,
-                    "item": {
-                        "id": message_id,
-                        "type": "message",
-                        "status": "in_progress",
-                        "role": "assistant",
-                        "content": [],
-                    },
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data.get("error"), dict):
+                failed = True
+                error = data["error"]
+                last_error = {
+                    "code": error.get("type") or "upstream_error",
+                    "message": error.get("message") or "Upstream error",
+                }
+                yield event("error", {
+                    **last_error,
+                    "param": None,
                 })
-                yield event("response.content_part.added", {
+                continue
+            if data.get("model"):
+                response_model = str(data["model"])
+            if isinstance(data.get("created"), int):
+                created_at = data["created"]
+            if isinstance(data.get("usage"), dict):
+                raw_usage = data["usage"]
+                usage = {
+                    "input_tokens": int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0),
+                    "output_tokens": int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0),
+                    "total_tokens": int(raw_usage.get("total_tokens") or 0),
+                }
+                if not usage["total_tokens"]:
+                    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            terminal_seen |= bool(choices[0].get("finish_reason"))
+            delta = choices[0].get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            emitted_payload = False
+            if isinstance(content, str) and content:
+                emitted_payload = True
+                if not text_started:
+                    text_started = True
+                    yield event("response.output_item.added", {
+                        "output_index": 0,
+                        "item": {
+                            "id": message_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    })
+                    yield event("response.content_part.added", {
+                        "item_id": message_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []},
+                    })
+                text += content
+                yield event("response.output_text.delta", {
                     "item_id": message_id,
                     "output_index": 0,
                     "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []},
+                    "delta": content,
                 })
-            text += content
-            yield event("response.output_text.delta", {
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "delta": content,
-            })
-        raw_tool_calls = delta.get("tool_calls", []) or []
-        if not raw_tool_calls and isinstance(delta.get("function_call"), dict):
-            raw_tool_calls = [{"index": 0, "function": delta["function_call"]}]
-        for raw_call in raw_tool_calls:
-            if not isinstance(raw_call, dict):
-                continue
-            emitted_payload = True
-            index = int(raw_call.get("index") or 0)
-            state = tools.setdefault(index, {
-                "item_id": f"fc_{uuid.uuid4().hex}",
-                "call_id": "",
-                "name": "",
-                "arguments": "",
-                "started": False,
-                "pending_arguments": "",
-            })
-            if raw_call.get("id"):
-                state["call_id"] = str(raw_call["id"])
-            function = raw_call.get("function")
-            if isinstance(function, dict):
-                if function.get("name"):
-                    state["name"] += str(function["name"])
-                if function.get("arguments"):
-                    state["pending_arguments"] += str(function["arguments"])
-            if state["name"] and not state["started"]:
-                state["started"] = True
-                state["call_id"] = state["call_id"] or f"call_{uuid.uuid4().hex}"
-                yield event("response.output_item.added", {
-                    "output_index": (1 if text_started else 0) + index,
-                    "item": {
-                        "id": state["item_id"],
-                        "type": "function_call",
-                        "status": "in_progress",
-                        "call_id": state["call_id"],
-                        "name": state["name"],
-                        "arguments": "",
-                    },
+            raw_tool_calls = delta.get("tool_calls", []) or []
+            if not raw_tool_calls and isinstance(delta.get("function_call"), dict):
+                raw_tool_calls = [{"index": 0, "function": delta["function_call"]}]
+            for raw_call in raw_tool_calls:
+                if not isinstance(raw_call, dict):
+                    continue
+                emitted_payload = True
+                index = int(raw_call.get("index") or 0)
+                state = tools.setdefault(index, {
+                    "item_id": f"fc_{uuid.uuid4().hex}",
+                    "call_id": "",
+                    "name": "",
+                    "arguments": "",
+                    "started": False,
+                    "pending_arguments": "",
                 })
-            if state["started"] and state["pending_arguments"]:
-                arguments_delta = state["pending_arguments"]
-                state["pending_arguments"] = ""
-                state["arguments"] += arguments_delta
-                yield event("response.function_call_arguments.delta", {
-                    "item_id": state["item_id"],
-                    "output_index": (1 if text_started else 0) + index,
-                    "delta": arguments_delta,
-                })
-        if not emitted_payload and not choices[0].get("finish_reason"):
-            yield b": keepalive\n\n"
+                if raw_call.get("id"):
+                    state["call_id"] = str(raw_call["id"])
+                function = raw_call.get("function")
+                if isinstance(function, dict):
+                    if function.get("name"):
+                        state["name"] += str(function["name"])
+                    if function.get("arguments"):
+                        state["pending_arguments"] += str(function["arguments"])
+                if state["name"] and not state["started"]:
+                    state["started"] = True
+                    state["call_id"] = state["call_id"] or f"call_{uuid.uuid4().hex}"
+                    yield event("response.output_item.added", {
+                        "output_index": (1 if text_started else 0) + index,
+                        "item": {
+                            "id": state["item_id"],
+                            "type": "function_call",
+                            "status": "in_progress",
+                            "call_id": state["call_id"],
+                            "name": state["name"],
+                            "arguments": "",
+                        },
+                    })
+                if state["started"] and state["pending_arguments"]:
+                    arguments_delta = state["pending_arguments"]
+                    state["pending_arguments"] = ""
+                    state["arguments"] += arguments_delta
+                    yield event("response.function_call_arguments.delta", {
+                        "item_id": state["item_id"],
+                        "output_index": (1 if text_started else 0) + index,
+                        "delta": arguments_delta,
+                    })
+            if not emitted_payload and not choices[0].get("finish_reason"):
+                yield b": keepalive\n\n"
 
     if failed:
         failed_response = response_object("failed")
         failed_response["error"] = last_error
         yield event("response.failed", {"response": failed_response})
+        return
+    if strict_terminal and not terminal_seen:
         return
     async for tail in finalize():
         yield tail
@@ -580,6 +586,7 @@ async def chat_stream_to_anthropic(
     body: AsyncIterator[Any],
     *,
     model: str,
+    strict_terminal: bool = False,
 ) -> AsyncIterator[bytes]:
     message_id = f"msg_{uuid.uuid4().hex}"
     response_model = model
@@ -589,6 +596,7 @@ async def chat_stream_to_anthropic(
     tools: dict[int, dict[str, Any]] = {}
     usage = {"input_tokens": 0, "output_tokens": 0}
     finish_reason = "stop"
+    terminal_seen = False
     finished = False
     failed = False
 
@@ -633,117 +641,121 @@ async def chat_stream_to_anthropic(
         yield _sse("message_stop", {"type": "message_stop"})
         finished = True
 
-    async for _event_name, payload in iter_sse_events(body):
-        if payload == "[DONE]":
-            if failed:
-                yield _sse("message_stop", {"type": "message_stop"})
+    async with aclosing(iter_sse_events(body)) as source:
+        async for _event_name, payload in source:
+            if payload == "[DONE]":
+                if failed:
+                    yield _sse("message_stop", {"type": "message_stop"})
+                    return
+                async for tail in finalize():
+                    yield tail
                 return
-            async for tail in finalize():
-                yield tail
-            return
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data.get("error"), dict):
-            failed = True
-            error = data["error"]
-            yield _sse("error", {
-                "type": "error",
-                "error": {
-                    "type": error.get("type") or "upstream_error",
-                    "message": error.get("message") or "Upstream error",
-                },
-            })
-            continue
-        if data.get("model"):
-            response_model = str(data["model"])
-        raw_usage = data.get("usage")
-        if isinstance(raw_usage, dict):
-            usage = {
-                "input_tokens": int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0),
-                "output_tokens": int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0),
-            }
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            continue
-        choice = choices[0]
-        if choice.get("finish_reason"):
-            finish_reason = str(choice["finish_reason"])
-        delta = choice.get("delta")
-        if not isinstance(delta, dict):
-            continue
-        content = delta.get("content")
-        emitted_payload = False
-        if isinstance(content, str) and content:
-            emitted_payload = True
-            if text_index is None:
-                text_index = next_block_index
-                next_block_index += 1
-                yield _sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": text_index,
-                    "content_block": {"type": "text", "text": "", "citations": None},
-                })
-            text += content
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta",
-                "index": text_index,
-                "delta": {"type": "text_delta", "text": content},
-            })
-        raw_tool_calls = delta.get("tool_calls", []) or []
-        if not raw_tool_calls and isinstance(delta.get("function_call"), dict):
-            raw_tool_calls = [{"index": 0, "function": delta["function_call"]}]
-        for raw_call in raw_tool_calls:
-            if not isinstance(raw_call, dict):
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
                 continue
-            emitted_payload = True
-            call_index = int(raw_call.get("index") or 0)
-            state = tools.setdefault(call_index, {
-                "id": "",
-                "name": "",
-                "arguments": "",
-                "pending_arguments": "",
-                "started": False,
-                "block_index": -1,
-            })
-            if raw_call.get("id"):
-                state["id"] = str(raw_call["id"])
-            function = raw_call.get("function")
-            if isinstance(function, dict):
-                if function.get("name"):
-                    state["name"] += str(function["name"])
-                if function.get("arguments"):
-                    state["pending_arguments"] += str(function["arguments"])
-            if state["name"] and not state["started"]:
-                state["started"] = True
-                state["block_index"] = next_block_index
-                next_block_index += 1
-                state["id"] = state["id"] or f"toolu_{uuid.uuid4().hex}"
-                yield _sse("content_block_start", {
-                    "type": "content_block_start",
-                    "index": state["block_index"],
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": state["id"],
-                        "name": state["name"],
-                        "input": {},
+            if isinstance(data.get("error"), dict):
+                failed = True
+                error = data["error"]
+                yield _sse("error", {
+                    "type": "error",
+                    "error": {
+                        "type": error.get("type") or "upstream_error",
+                        "message": error.get("message") or "Upstream error",
                     },
                 })
-            if state["started"] and state["pending_arguments"]:
-                arguments_delta = state["pending_arguments"]
-                state["pending_arguments"] = ""
-                state["arguments"] += arguments_delta
+                continue
+            if data.get("model"):
+                response_model = str(data["model"])
+            raw_usage = data.get("usage")
+            if isinstance(raw_usage, dict):
+                usage = {
+                    "input_tokens": int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0),
+                    "output_tokens": int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0),
+                }
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0]
+            terminal_seen |= bool(choice.get("finish_reason"))
+            if choice.get("finish_reason"):
+                finish_reason = str(choice["finish_reason"])
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            emitted_payload = False
+            if isinstance(content, str) and content:
+                emitted_payload = True
+                if text_index is None:
+                    text_index = next_block_index
+                    next_block_index += 1
+                    yield _sse("content_block_start", {
+                        "type": "content_block_start",
+                        "index": text_index,
+                        "content_block": {"type": "text", "text": "", "citations": None},
+                    })
+                text += content
                 yield _sse("content_block_delta", {
                     "type": "content_block_delta",
-                    "index": state["block_index"],
-                    "delta": {"type": "input_json_delta", "partial_json": arguments_delta},
+                    "index": text_index,
+                    "delta": {"type": "text_delta", "text": content},
                 })
-        if not emitted_payload and not choice.get("finish_reason"):
-            yield _sse("ping", {"type": "ping"})
+            raw_tool_calls = delta.get("tool_calls", []) or []
+            if not raw_tool_calls and isinstance(delta.get("function_call"), dict):
+                raw_tool_calls = [{"index": 0, "function": delta["function_call"]}]
+            for raw_call in raw_tool_calls:
+                if not isinstance(raw_call, dict):
+                    continue
+                emitted_payload = True
+                call_index = int(raw_call.get("index") or 0)
+                state = tools.setdefault(call_index, {
+                    "id": "",
+                    "name": "",
+                    "arguments": "",
+                    "pending_arguments": "",
+                    "started": False,
+                    "block_index": -1,
+                })
+                if raw_call.get("id"):
+                    state["id"] = str(raw_call["id"])
+                function = raw_call.get("function")
+                if isinstance(function, dict):
+                    if function.get("name"):
+                        state["name"] += str(function["name"])
+                    if function.get("arguments"):
+                        state["pending_arguments"] += str(function["arguments"])
+                if state["name"] and not state["started"]:
+                    state["started"] = True
+                    state["block_index"] = next_block_index
+                    next_block_index += 1
+                    state["id"] = state["id"] or f"toolu_{uuid.uuid4().hex}"
+                    yield _sse("content_block_start", {
+                        "type": "content_block_start",
+                        "index": state["block_index"],
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": state["id"],
+                            "name": state["name"],
+                            "input": {},
+                        },
+                    })
+                if state["started"] and state["pending_arguments"]:
+                    arguments_delta = state["pending_arguments"]
+                    state["pending_arguments"] = ""
+                    state["arguments"] += arguments_delta
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": state["block_index"],
+                        "delta": {"type": "input_json_delta", "partial_json": arguments_delta},
+                    })
+            if not emitted_payload and not choice.get("finish_reason"):
+                yield _sse("ping", {"type": "ping"})
 
     if failed:
         yield _sse("message_stop", {"type": "message_stop"})
+        return
+    if strict_terminal and not terminal_seen:
         return
     async for tail in finalize():
         yield tail

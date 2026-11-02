@@ -18,3 +18,12 @@ Application updates build an immutable image, then explicitly invoke `python3 st
 Run the complete offline suite, including lifecycle/task-scope, cross-process shared-state and compatibility tests. For release/runtime changes, additionally run real Nginx SSE + WebSocket promotion and rollback probes, including a drain timeout and old-connection continuity. The admin diagnostic endpoints use a separate private token and never call a model. Tests must not initialize GPU workers or use paid inference.
 
 This is a single-host planned-application-upgrade guarantee, not a promise against machine/power failure. Multi-host scheduling requires a separately designed fenced distributed lease/store. Stable ingress/kernel upgrades are infrastructure maintenance and must not be presented as ordinary zero-loss feature deployments.
+
+## Request-mode ownership
+
+- A request follows the caller's stream/non-stream choice unless the selected channel or exact upstream model explicitly says otherwise.
+- One selector only: `streaming.force_upstream` is `auto`, `stream`, or `json`. It belongs on a channel policy, or an exact-model rule scoped to one channel. A model's explicit `auto` overrides its channel; removing the model override inherits the channel.
+- Never add a global conversion default, a second directional conversion boolean, or a forced mode hidden inside profiles, routes or cross-channel regex rules. Other feature policies keep their existing ownership.
+- `/admin/request-modes` shows the final mode and source. Its authenticated API updates the original runtime flags with revision checks, kernel file locking and inode-preserving writes. Do not overwrite the whole file from a stale snapshot.
+- In logs, distinguish `client_stream` from `upstream_stream`; the words `nonstream_dedupe` or `nonstream_keepalive` alone do not describe the provider request mode.
+- Request-mode migrations must audit existing selected models and exact-request lock keys, preserve active request snapshots, and roll through the release controller. Never use paid generation or wake a GPU as a configuration test.

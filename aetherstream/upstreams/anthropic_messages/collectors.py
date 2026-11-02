@@ -11,6 +11,7 @@ from aetherstream.observability.refusals import AnthropicRefusalDiagnostics
 from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection
 
 from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME
+from aetherstream.features.normal_completion_guard import observe_natural_finish, invalidate_natural_finish
 
 from .protocol import (
     _append_raw_line,
@@ -124,11 +125,13 @@ async def collect_anthropic_messages_as_chat_completion(
                     model_name = str(data.get('model') or model)
                     usage = _normalize_usage(data.get('usage'))
                     stop_reason = data.get('stop_reason')
+                    observe_natural_finish(stop_reason)
                     for index, block in enumerate(data['content']):
                         if not isinstance(block, dict):
                             continue
                         if block.get('type') == 'tool_use':
                             if block.get('name') == TERMINAL_TOOL_NAME:
+                                invalidate_natural_finish()
                                 stop_reason = 'tool_use' if tool_calls.as_openai() else 'end_turn'
                                 break
                             tool_calls.start(index, block)
@@ -136,6 +139,7 @@ async def collect_anthropic_messages_as_chat_completion(
                             value = block.get('text' if block['type'] == 'text' else 'thinking')
                             full_content += value if isinstance(value, str) else ''
                             if deps.has_stop_tag(full_content):
+                                invalidate_natural_finish()
                                 full_content = full_content[:deps.find_stop_tag(full_content)]
                                 stop_reason = 'end_turn'
                                 break
@@ -197,7 +201,6 @@ async def collect_anthropic_messages_as_chat_completion(
                         if message.get("model"):
                             model_name = str(message["model"])
                         usage = _normalize_usage(message.get("usage"), usage)
-                        continue
 
                     if event_type == "content_block_start":
                         block = data.get("content_block") or {}
@@ -227,9 +230,9 @@ async def collect_anthropic_messages_as_chat_completion(
                             )
                         if block.get("type") == "tool_use":
                             tool_calls.start(int(data.get("index") or 0), block)
-                        continue
+                            continue
 
-                    if event_type == "content_block_delta":
+                    if event_type in {"message_start", "content_block_start", "content_block_delta"}:
                         raw_delta = data.get("delta") or {}
                         if isinstance(raw_delta, dict) and tool_calls.append_delta(
                             int(data.get("index") or 0),
@@ -276,6 +279,7 @@ async def collect_anthropic_messages_as_chat_completion(
 
                     if event_type == "message_stop":
                         saw_message_stop = True
+                        observe_natural_finish(stop_reason)
                         finish_status = f"message_stop:{stop_reason or 'stop'}"
                         if deps.retire_refused_session(stop_reason, trace_prefix):
                             _cancel_claude_cache_post_keepalive(
@@ -426,7 +430,6 @@ async def collect_anthropic_messages_response(
                         if message.get("model"):
                             model_name = str(message["model"])
                         usage = _normalize_usage(message.get("usage"), usage)
-                        continue
 
                     if event_type == "content_block_start":
                         block = data.get("content_block") or {}
@@ -455,9 +458,8 @@ async def collect_anthropic_messages_response(
                                 out_chars=len(full_content),
                             )
                             return response_payload, "\n".join(raw_sse_lines)
-                        continue
 
-                    if event_type == "content_block_delta":
+                    if event_type in {"message_start", "content_block_start", "content_block_delta"}:
                         delta = _extract_anthropic_sse_text(data)
                         if not delta:
                             continue

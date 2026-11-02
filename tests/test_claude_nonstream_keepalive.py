@@ -122,21 +122,27 @@ class ClaudeNonstreamKeepaliveTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(heartbeats), 1)
             self.assertEqual(result['choices'][0]['message']['content'], 'offline ok')
 
-    async def test_reconnect_joins_detached_nonstream_work_without_reposting(self):
-        release = asyncio.Event()
+    async def test_last_disconnect_cancels_upstream_and_reconnect_starts_fresh(self):
+        release, closed = asyncio.Event(), asyncio.Event()
         async def handler(_):
-            await release.wait()
-            return httpx.Response(200, json=self.result())
+            try:
+                await release.wait()
+                return httpx.Response(200, json=self.result())
+            finally:
+                closed.set()
         with self.transport(handler):
             beats, body = await self.request(disconnect_on_heartbeat=True)
             self.assertTrue(beats)
             self.assertIsNone(body)
-            self.assertEqual((await self.coalescer.state())['inflight'], 1)
+            before = len(self.requests)
+            if before:
+                self.assertTrue(closed.is_set())
+            self.assertEqual(await self.coalescer.state(), {'inflight': 0, 'recent': 0})
             reconnect = asyncio.create_task(self.request())
             await asyncio.sleep(0.03)
             release.set()
             _, result = await reconnect
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.requests), before + 1)
         self.assertEqual(result['choices'][0]['message']['content'], 'offline ok')
         self.assertEqual((await self.coalescer.state())['inflight'], 0)
 

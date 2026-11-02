@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stream · 请求方式</title>
+<style>
+:root{color-scheme:light;--paper:#f2f1eb;--panel:#fcfcf8;--ink:#202f2b;--muted:#64716a;--line:#d3d9d1;--green:#235f47;--error:#9f302b}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:"PingFang SC","Microsoft YaHei",sans-serif;font-size:15px;line-height:1.6}button,input,select{font:inherit}button,select{cursor:pointer}button{border:1px solid var(--line);padding:.55rem .9rem;background:var(--panel);color:var(--ink);border-radius:3px}button:hover{border-color:var(--green)}button:disabled{opacity:.55;cursor:wait}button.primary{background:var(--green);color:white;border-color:var(--green)}input,select{border:1px solid #aebbb1;background:white;color:var(--ink);border-radius:3px;padding:.58rem .7rem;min-height:44px}input:focus,select:focus,button:focus-visible{outline:2px solid var(--green);outline-offset:3px}header{border-top:5px solid var(--green);border-bottom:1px solid var(--line);padding:32px max(24px,calc((100vw - 1120px)/2)) 26px;background:var(--panel)}.eyebrow{font:12px ui-monospace,monospace;letter-spacing:.16em;color:var(--green)}h1{font-family:"Iowan Old Style","Noto Serif CJK SC","Songti SC",serif;font-size:34px;letter-spacing:.03em;margin:8px 0}p{margin:.5rem 0}.subtle{color:var(--muted)}main{max-width:1168px;margin:0 auto;padding:26px 24px 64px}.notice{padding:12px 16px;border-left:3px solid var(--green);background:#e8eee5;margin-bottom:22px}.notice.error{border-color:var(--error);color:var(--error);background:#f9e9e5}.login{max-width:600px;padding:26px;border:1px solid var(--line);background:var(--panel)}.login label{display:block;font-weight:600;margin-bottom:8px}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.row input{flex:1;min-width:180px}.layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:25px}aside{min-width:0}#channel-filter{width:100%;margin-bottom:12px}.channels{display:flex;flex-direction:column;gap:4px;max-height:580px;overflow:auto}.channels button{text-align:left;background:transparent;border-color:transparent;border-left:3px solid transparent;border-radius:0;overflow-wrap:anywhere}.channels button.active{background:#e1e9de;border-left-color:var(--green);color:var(--green);font-weight:600}.card{background:var(--panel);border:1px solid var(--line);padding:25px;margin-bottom:22px;min-width:0}.section-no{font:12px ui-monospace,monospace;color:var(--muted);letter-spacing:.12em}.card h2{font-size:20px;margin:6px 0 16px;overflow-wrap:anywhere}.rule{border-top:1px solid var(--line);margin-top:20px;padding-top:16px}.rule strong{font-weight:600}.effect{color:var(--muted);margin-top:8px;font-size:14px}.model-row{border-top:1px solid var(--line);padding:16px 0;display:grid;grid-template-columns:minmax(100px,1fr) auto;gap:12px;align-items:center}.model-name{font-family:ui-monospace,monospace;overflow-wrap:anywhere;font-size:13px}.model-source{font-size:13px;color:var(--muted)}.toolbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:20px}.toolbar p{font-size:13px}.empty{color:var(--muted);padding:14px 0}.preview{margin-top:16px;padding:16px;background:#edf1e9;overflow-wrap:anywhere}.preview dt{font-size:12px;color:var(--muted)}.preview dd{margin:0 0 8px}.small{font-size:13px}footer{color:var(--muted);font-size:13px;margin-top:22px}code{font-family:ui-monospace,monospace;font-size:13px}[hidden]{display:none!important}@media(max-width:720px){header{padding:18px 20px}header p{font-size:13px}main{padding:16px 16px 40px}h1{font-size:28px}.notice{padding:10px 12px;font-size:13px;margin-bottom:16px}.toolbar .row{flex-wrap:nowrap;gap:8px}.toolbar p{max-width:155px;font-size:11px}.toolbar button{padding:.45rem .65rem}.layout{grid-template-columns:1fr}.channels{flex-direction:row;max-height:150px;flex-wrap:wrap}.channels button{border-left:0;border-bottom:3px solid transparent}.channels button.active{border-left:0;border-bottom-color:var(--green)}.card{padding:20px}.model-row{grid-template-columns:1fr}.model-row .row{justify-content:flex-start}.toolbar{align-items:flex-start}input,select{max-width:100%}.row>button{min-height:44px}}
+</style>
+<header><div class="eyebrow">STREAM / REQUEST MODE</div><h1>请求方式</h1><p class="subtle">渠道设默认，模型可覆盖。没有全局转换开关。</p></header>
+<main>
+<div id="message" class="notice" role="status" aria-live="polite">默认原样跟随酒馆。这里仅决定发给供应商的请求方式，不改变酒馆自己的选择。</div>
+<section id="login" class="login"><label for="token">私有管理令牌</label><div class="row"><input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="只在当前页面内使用"><button id="connect" class="primary">读取设置</button></div><p class="small subtle">令牌不写入网址或浏览器存储。本页面不会发起模型推理。</p></section>
+<section id="console" hidden>
+<div class="toolbar"><p id="revision" class="subtle"></p><div class="row"><button id="refresh">重新读取</button><button id="disconnect">退出</button></div></div>
+<div class="layout"><aside><label for="channel-filter" class="small subtle">查找渠道</label><input id="channel-filter" type="search" placeholder="渠道名称"><nav id="channels" class="channels" aria-label="渠道"></nav></aside>
+<div id="details">
+<section class="card"><div class="section-no">01 / CHANNEL</div><h2 id="channel-title"></h2><label for="channel-mode">这个渠道的请求方式</label><div class="row"><select id="channel-mode" aria-label="渠道请求方式"></select><button id="save-channel" class="primary">保存渠道设置</button></div><div id="channel-effective" class="rule"></div><div id="channel-effect" class="effect"></div></section>
+<section class="card"><div class="section-no">02 / MODEL OVERRIDES</div><h2>模型例外</h2><p class="subtle small">未列出的模型使用渠道设置。选择“跟随酒馆”可明确覆盖渠道的固定模式。</p><div id="model-list"></div><div class="rule"><label for="public-model">检查模型，或添加一个例外</label><div class="row"><input id="public-model" list="public-models" placeholder="酒馆中显示的完整模型名" autocomplete="off"><datalist id="public-models"></datalist><button id="check-model">检查，不生成</button></div><p class="small subtle">按真实渠道和实际模型名保存；指向同一实际模型的别名共用设置。</p></div><div id="preview" class="preview" hidden></div></section>
+</div></div>
+<footer>优先级只有两层：渠道、该渠道内的精确模型。保存只影响新请求，正在生成的请求保持原模式。已修改的设置不会被旧页面静默覆盖。</footer>
+</section></main>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const labels = {auto:'跟随酒馆',stream:'固定流式',json:'固定非流式'};
+  let token='', state=null, channel='', preview=null, busy=false;
+  const node = (tag, text, cls) => {const x=document.createElement(tag);if(text!==undefined)x.textContent=text;if(cls)x.className=cls;return x;};
+  const notify = (text,error=false) => {$('message').textContent=text;$('message').className='notice'+(error?' error':'');};
+  const source = info => info.source==='model'?'模型单独设置':info.source==='channel'?'渠道设置':'未设置，默认跟随酒馆';
+  const effect = mode => mode==='stream'?'酒馆选择流或非流，发给供应商的请求均为流式。':mode==='json'?'酒馆选择流或非流，发给供应商的请求均为非流式。':'酒馆选流就发流，选非流就发非流。';
+  function options(select, includeInherit=false) {select.replaceChildren();if(includeInherit)select.appendChild(new Option('使用渠道设置（移除模型例外）','inherit'));for(const [value,label] of Object.entries(labels))select.appendChild(new Option(label,value));}
+  async function api(path, body) {
+    const response=await fetch('/admin/request-modes/'+path,{method:body?'POST':'GET',cache:'no-store',headers:{Authorization:'Bearer '+token,...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})});
+    const data=await response.json();
+    if(!response.ok){const e=new Error(data.error||'读取失败');e.status=response.status;throw e;}return data;
+  }
+  async function action(fn) {if(busy)return;busy=true;notify('正在处理，请稍候…');document.querySelectorAll('button').forEach(b=>b.disabled=true);try{await fn();}catch(e){notify(e.status===409?'设置已被其他页面修改。请点“重新读取”，确认后再保存。':e.message,true);}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false);}}
+  function renderChannels() {
+    const filter=$('channel-filter').value.toLowerCase();$('channels').replaceChildren();
+    for(const item of state.channels){if(!item.id.toLowerCase().includes(filter))continue;const b=node('button',item.id,item.id===channel?'active':'');b.type='button';b.setAttribute('aria-current',String(item.id===channel));b.onclick=()=>{channel=item.id;preview=null;render();};$('channels').appendChild(b);}
+  }
+  function render() {
+    $('login').hidden=true;$('console').hidden=false;$('revision').textContent='当前配置版本 '+state.revision.slice(0,12)+' · 已从服务器读取';
+    if(!state.channels.some(c=>c.id===channel))channel=state.channels[0]?.id||'';
+    renderChannels();const info=state.channels.find(c=>c.id===channel);$('details').hidden=!info;if(!info)return;
+    $('channel-title').textContent=info.id;options($('channel-mode'));$('channel-mode').value=info.mode;
+    $('channel-effective').textContent='最终方式：'+info.label+'；来源：'+source(info)+'。';$('channel-effect').textContent=effect(info.mode);
+    $('model-list').replaceChildren();
+    if(!info.models.length)$('model-list').appendChild(node('p','没有模型例外。','empty'));
+    for(const model of info.models){const row=node('div',undefined,'model-row'),title=node('div');title.appendChild(node('div',model.upstream_model,'model-name'));title.appendChild(node('div','最终：'+model.label+' · 来源：模型单独设置','model-source'));row.appendChild(title);const controls=node('div',undefined,'row'),select=node('select');select.setAttribute('aria-label',model.upstream_model+' 的请求方式');options(select,true);select.value=model.mode;controls.appendChild(select);const button=node('button','保存');button.onclick=()=>save(info.id,model.upstream_model,select.value);controls.appendChild(button);row.appendChild(controls);$('model-list').appendChild(row);}
+    $('public-models').replaceChildren();for(const model of state.catalog.filter(m=>m.channel===channel)){$('public-models').appendChild(new Option(model.id,model.id));}
+    renderPreview();
+  }
+  function renderPreview() {
+    $('preview').replaceChildren();$('preview').hidden=!preview;if(!preview)return;
+    const dl=node('dl');for(const [key,value] of [['公开模型',preview.public_model],['真实渠道',preview.channel],['实际模型名',preview.upstream_model],['最终方式',preview.label],['设置来源',source(preview)]]){dl.appendChild(node('dt',key));dl.appendChild(node('dd',value));}$('preview').appendChild(dl);$('preview').appendChild(node('p',effect(preview.mode),'small'));
+    const row=node('div',undefined,'row'),select=node('select');options(select,true);select.value=preview.source==='model'?preview.mode:'inherit';row.appendChild(select);const button=node('button','保存这个模型的设置','primary');button.onclick=()=>save(preview.channel,preview.upstream_model,select.value);row.appendChild(button);$('preview').appendChild(row);
+  }
+  async function load() {state=await api('state');preview=null;render();notify(state.catalog_error||'已读取。未单独设置的渠道跟随酒馆；模型只覆盖其所属渠道。',!!state.catalog_error);}
+  function save(cid, model, mode) {action(async()=>{state=await api('state',{revision:state.revision,channel:cid,model,mode});channel=cid;preview=null;render();notify('已保存。新请求使用新设置；正在生成的请求不受影响。');});}
+  $('connect').onclick=()=>action(async()=>{token=$('token').value.trim();if(!token)throw new Error('请输入私有管理令牌。');await load();$('token').value='';});
+  $('token').onkeydown=e=>{if(e.key==='Enter')$('connect').click();};
+  $('refresh').onclick=()=>action(load);
+  $('disconnect').onclick=()=>{token='';state=null;preview=null;$('token').value='';$('console').hidden=true;$('login').hidden=false;notify('已退出。令牌未保存在浏览器中。');};
+  $('channel-filter').oninput=()=>{if(state)renderChannels();};
+  $('save-channel').onclick=()=>save(channel,null,$('channel-mode').value);
+  $('check-model').onclick=()=>action(async()=>{const model=$('public-model').value.trim();if(!model)throw new Error('请输入酒馆中显示的完整模型名。');const result=await api('resolve?model='+encodeURIComponent(model));if(result.revision!==state.revision)throw Object.assign(new Error('设置已变化'),{status:409});preview=result;renderPreview();notify('已检查实际路由和设置，没有发起推理。');});
+})();
+</script></html>

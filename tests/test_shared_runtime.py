@@ -67,22 +67,26 @@ class SharedRuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def good():return {'good':True}
         self.assertEqual(await self.b.exact_response('key',10,good),({'good':True},False))
 
-    async def test_disconnect_does_not_hide_detached_upstream_task(self):
-        coalescer=ExactRequestCoalescer(ttl=60,log=lambda _:None,shared_state=self.a)
-        started=asyncio.Event();finish=asyncio.Event()
-        async def runner():started.set();await finish.wait();return {'ok':True}
-        waiter=asyncio.create_task(coalescer.run(dedupe_key='key',trace_id='x',upstream_label='fixture',runner=runner))
-        await started.wait();waiter.cancel()
-        with self.assertRaises(asyncio.CancelledError):await waiter
-        self.assertEqual((await coalescer.state())['inflight'],1)
-        finish.set()
-        for _ in range(100):
-            if (await coalescer.state())['inflight']==0:break
-            await asyncio.sleep(.01)
-        self.assertEqual((await coalescer.state())['inflight'],0)
-        async def forbidden():self.fail('must use shared result')
+    async def test_disconnect_cancels_unobserved_shared_upstream_and_releases_lock(self):
+        coalescer = ExactRequestCoalescer(ttl=60, log=lambda _:None, shared_state=self.a)
+        started, closed = asyncio.Event(), asyncio.Event()
+        async def runner():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+        waiter = asyncio.create_task(coalescer.run(dedupe_key='key', trace_id='x', upstream_label='fixture', runner=runner))
+        await started.wait()
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        self.assertTrue(closed.is_set())
+        self.assertEqual(await coalescer.state(), {'inflight':0, 'recent':0})
+        self.assertEqual(self.a.response_waiters('key'), 0)
+        async def fresh():return {'ok':True}
         other=ExactRequestCoalescer(ttl=60,log=lambda _:None,shared_state=self.b)
-        self.assertEqual(await other.run(dedupe_key='key',trace_id='y',upstream_label='fixture',runner=forbidden),({'ok':True},True))
+        self.assertEqual(await other.run(dedupe_key='key',trace_id='y',upstream_label='fixture',runner=fresh),({'ok':True},False))
 
     async def test_detached_task_barrier_survives_returning_to_caller(self):
         from aetherstream.runtime.tasks import spawn_detached, pending_count

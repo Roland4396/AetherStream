@@ -67,6 +67,10 @@ def apply_glm52_official_thinking(payload: dict[str, Any]) -> list[str]:
 def enforce_glm52_official_thinking(
     payload: dict[str, Any], *, log: Callable[[str], None], trace_prefix: str,
 ) -> None:
+    from aetherstream.routing.channel_policy import current_policy
+    policy = current_policy()
+    if policy is not None and not policy.get('adapter', {}).get('glm52_thinking'):
+        return
     if not is_glm52_model(payload.get('model')):
         return
     changed = apply_glm52_official_thinking(payload)

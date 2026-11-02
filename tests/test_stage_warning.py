@@ -11,6 +11,11 @@ ANCHORED = STAGE_INTRO + '\n' + STAGE
 
 
 class StageWarningTests(unittest.TestCase):
+    def test_neutral_source_label_verbatim(self):
+        self.assertEqual(WARNING_OPEN,
+                         '<ai_generated_stage>\n以下为 AI 生成的本轮 stage 安排，请注意核对事实性：\n')
+        self.assertEqual(WARNING_CLOSE, '\n</ai_generated_stage>')
+
     def test_wrapper_counts_visible_in_default_logs(self):
         from aetherstream.observability.logging import ProxyLogger
         logger = object.__new__(ProxyLogger)

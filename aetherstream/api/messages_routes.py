@@ -122,7 +122,7 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
                 media_type='text/event-stream'
             )
 
-        # 非流式：默认内部流式收集；关闭开关时保留上游非流式。
+        # 非流式默认原样请求；只有明确绑定的请求方式策略允许转换。
         try:
             upstream_stream = _claude_nonstream_to_stream_enabled(deps)
             deps.log(
@@ -189,7 +189,6 @@ async def anthropic_messages(request: Request, deps: RouteDependencies):
 
 MESSAGES_DEPENDENCY_NAMES = (
     'MAX_RAW_SSE_BYTES',
-    '_runtime_lookup',
     'build_anthropic_messages_deps',
     'build_claude_messages_url',
     'build_claude_upstream_headers',
@@ -213,19 +212,9 @@ def register_routes(app, ctx: dict[str, Any]) -> RouteDependencies:
     nonstream_keepalive_interval = float(ctx.get('NONSTREAM_KEEPALIVE_INTERVAL', 10.0))
 
     async def anthropic_messages_endpoint(request: Request):
-        try:
-            payload = await request.json()
-        except Exception:
-            return await route_protocol_request(request, chat_deps, protocol="anthropic")
-
-        if not isinstance(payload, dict) or payload.get('stream', False):
-            return await route_protocol_request(request, chat_deps, protocol="anthropic")
-
-        return keepalive_json_response(
-            lambda: route_protocol_request(request, chat_deps, protocol="anthropic"),
-            interval=nonstream_keepalive_interval,
-            trace_id=getattr(request.state, 'trace_id', ''),
-            log=chat_deps.log,
+        from aetherstream.api.request_entry import protocol_entry
+        return await protocol_entry(
+            request, chat_deps, lambda: route_protocol_request(request, chat_deps, protocol="anthropic"), interval=nonstream_keepalive_interval,
         )
 
     app.post('/v1/messages')(anthropic_messages_endpoint)

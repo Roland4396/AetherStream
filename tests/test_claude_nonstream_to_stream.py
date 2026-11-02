@@ -19,6 +19,7 @@ from aetherstream.api.chat_routes import chat_completions, _claude_nonstream_to_
 from aetherstream.api.messages_routes import anthropic_messages
 from aetherstream.api.protocol_gateway import route_protocol_request
 from aetherstream.runtime.flags import RuntimeFlags
+from aetherstream.routing.channel_policy import policy_scope
 from aetherstream.upstreams.anthropic_messages import collectors
 from aetherstream.upstreams.anthropic_messages.types import AnthropicMessagesDeps
 
@@ -41,8 +42,15 @@ def chat_body(model):
 
 def sse_body(native, model):
     if native:
+        # Official message_start is an empty shell, not the final JSON body.
+        # Reusing final content here would send OK twice once initial text is
+        # correctly consumed. Keep this conversion-switch fixture canonical.
+        # https://platform.claude.com/docs/en/build-with-claude/streaming
+        initial = native_body()
+        initial['content'] = []
+        initial['stop_reason'] = None
         events = [
-            {'type': 'message_start', 'message': native_body()},
+            {'type': 'message_start', 'message': initial},
             {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}},
             {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': 'OK'}},
             {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'},
@@ -116,7 +124,8 @@ class ClaudeConversionRoutingTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json=native_body() if native else chat_body(outgoing['model']))
 
         with patch('httpx.AsyncClient', side_effect=lambda **kw: REAL_CLIENT(
-                transport=httpx.MockTransport(dispatch), **kw)):
+                transport=httpx.MockTransport(dispatch), **kw)), policy_scope(
+                    {'streaming': {'force_upstream': 'stream' if flag is True else 'auto'}}):
             request = make_request(payload)
             response = (await chat_completions(request, deps) if protocol == 'chat'
                         else await route_protocol_request(request, deps, protocol=protocol))
@@ -138,22 +147,22 @@ class ClaudeConversionRoutingTests(unittest.IsolatedAsyncioTestCase):
                                 flag=flag, stream=streaming, kind=kind, protocol=protocol)
                             self.assertEqual(resp.status_code, 200, (body, logs))
                             self.assertEqual(len(sent), 1)
-                            self.assertIs(sent[0]['stream'], streaming or flag is not False)
+                            self.assertIs(sent[0]['stream'], streaming or flag is True)
                             self.assertIn(b'OK', body)
                             if not streaming:
                                 self.assertIsInstance(json.loads(body), dict)
                                 self.assertNotIn(b'data:', body)
-                            if not streaming and (kind == 'native' or flag is False):
+                            if not streaming and (kind == 'native' or flag is not True):
                                 deps.run_exact_nonstream_once.assert_called_once()
                             else:
                                 deps.run_exact_nonstream_once.assert_not_called()
 
-    async def test_missing_flag_and_enabled_have_identical_upstream_payloads(self):
+    async def test_missing_mode_and_follow_have_identical_upstream_payloads(self):
         for kind in ('directory', 'free', 'native', 'passthrough'):
             for stream in (False, True):
                 old = await self.run_case(flag=None, stream=stream, kind=kind)
-                enabled = await self.run_case(flag=True, stream=stream, kind=kind)
-                self.assertEqual(old[2], enabled[2])
+                following = await self.run_case(flag=False, stream=stream, kind=kind)
+                self.assertEqual(old[2], following[2])
 
     async def test_disabling_changes_only_stream_field_of_upstream_request(self):
         for kind in ('directory', 'free', 'native', 'passthrough'):
@@ -187,7 +196,7 @@ class ClaudeConversionRoutingTests(unittest.IsolatedAsyncioTestCase):
                                          'frequency_penalty':0, 'stop':['<end>']})
                             self.assertEqual(resp.status_code, 200, (body, logs))
                             self.assertEqual(len(sent), 1)
-                            self.assertIs(sent[0]['stream'], flag is not False)
+                            self.assertIs(sent[0]['stream'], flag is True)
                             self.assertEqual(sent[0]['model'], alias if kind == 'free' else model)
                             self.assertEqual(saved[-1]['request_payload'], sent[0])
                             self.assertIs(saved[-1]['stream'], False)
@@ -282,13 +291,14 @@ class ClaudeConversionRoutingTests(unittest.IsolatedAsyncioTestCase):
                 calls.append(kwargs['upstream_stream'])
                 return native_body(), ''
             deps.collect_anthropic_messages_response = collect
-            with patch('httpx.AsyncClient.send', side_effect=AssertionError('External network forbidden')):
+            with patch('httpx.AsyncClient.send', side_effect=AssertionError('External network forbidden')), policy_scope(
+                    {'streaming': {'force_upstream': 'stream' if flag is True else 'auto'}}):
                 resp = await anthropic_messages(make_request({
                     'model': 'claude-opus-4-6', 'stream': False,
                     'messages': [{'role': 'user', 'content': 'Offline.'}],
                 }), deps)
             self.assertEqual(resp.status_code, 200)
-            self.assertEqual(calls, [flag is not False])
+            self.assertEqual(calls, [flag is True])
 
     def test_default_and_hot_reload(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -296,8 +306,8 @@ class ClaudeConversionRoutingTests(unittest.IsolatedAsyncioTestCase):
             path.write_text('{}')
             flags = RuntimeFlags(path=str(path), poll_sec=0, log=lambda _: None)
             deps = SimpleNamespace(_runtime_lookup=flags.lookup)
-            self.assertTrue(_claude_nonstream_to_stream_enabled(deps))
-            for value, expected in [(False, False), (True, True), ('false', False)]:
+            self.assertFalse(_claude_nonstream_to_stream_enabled(deps))
+            for value, expected in [(False, False), (True, False), ('false', False)]:
                 path.write_text(json.dumps({'claude': {'stream': {'nonstream_to_stream': value}}}))
                 flags._cache_mtime = None
                 self.assertEqual(_claude_nonstream_to_stream_enabled(deps), expected)

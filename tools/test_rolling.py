@@ -18,6 +18,7 @@ import websocket
 ROOT=Path(__file__).resolve().parents[2]
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--image',required=True,help='Locally built candidate image; never calls a model')
+parser.add_argument('--previous-image',help='Optional real previous image for bidirectional promotion/rollback')
 args=parser.parse_args()
 WORK=Path(tempfile.mkdtemp(prefix='stream-release-test-'))
 print('Test artifacts: '+str(WORK),flush=True)
@@ -59,7 +60,8 @@ try:
             '-v',str(WORK/('flags-'+slot+'.json'))+':/app/runtime-flags.json:ro','-v',str(WORK/'secrets')+':/app/secrets:ro',
             '-e','STREAM_INSTANCE_ID='+slot,'-e','STREAM_ACTIVE_CONTROL_FILE=/app/control/active.json',
             '-e','STREAM_LIFECYCLE_STATE_DIR=/app/state','-e','STREAM_SHARED_STATE_DIR=/app/state/shared',
-            '-e','STREAM_ADMIN_TOKEN_FILE=/app/secrets/admin.token','-e','STREAM_DIAGNOSTICS_ENABLED=true',image,
+            '-e','STREAM_ADMIN_TOKEN_FILE=/app/secrets/admin.token','-e','STREAM_DIAGNOSTICS_ENABLED=true',
+            args.previous_image if slot=='blue' and args.previous_image else image,
             'uvicorn','proxy:app','--host',cli.SLOTS[slot],'--port','3002')
     for _ in range(60):
         try:

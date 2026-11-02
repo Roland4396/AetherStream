@@ -85,6 +85,7 @@ class ProxyLogger:
             "inbound method=",
             "route to ",
             "request_start",
+            "request_mode client_stream=",
             "_headers status=",
             "first_data",
             "done reason=",
@@ -102,6 +103,9 @@ class ProxyLogger:
             "quota_keeper ",
             "runtime_lifecycle ",
             "early_stop_disclaimer_ignored ",
+            "early_stop_upstream_close ",
+            "normal_completion_guard ",
+            "gemini_anti_route ",
         )
         if any(token in lower for token in high_signal_tokens):
             return True

@@ -12,12 +12,16 @@ import uuid
 from diskcache import Cache
 from filelock import FileLock, Timeout
 
+from aetherstream.runtime.response_cache import response_can_replay
+
 
 class SharedRuntimeState:
     def __init__(self, directory):
         self.directory = str(Path(directory) / 'cache')
         self.locks = Path(directory) / 'request-locks'
         self.locks.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.waiter_locks = Path(directory) / 'response-waiters'
+        self.waiter_locks.mkdir(parents=True, exist_ok=True, mode=0o700)
         with Cache(self.directory) as cache, cache.transact():
             schema = cache.get('__state_schema__')
             if schema is None:
@@ -36,6 +40,26 @@ class SharedRuntimeState:
             state['last_used_at'] = now
             cache.set('session:'+key, state, expire=ttl)
             return state['session_id'], mode
+
+    def claim_completion_warning(self, key, threshold):
+        """Consume exactly one warning atomically, across release processes.
+
+        New prefixed keys are additive to schema 1. No expiry, state migration,
+        provider call, automatic retry or shared-data deletion is involved.
+        """
+        with Cache(self.directory) as cache, cache.transact():
+            name = 'normal-completion-guard:v1:' + key
+            if cache.get(name, 0) < threshold:
+                return False
+            cache.set(name, 0)
+            return True
+
+    def record_completion(self, key, normal, threshold):
+        with Cache(self.directory) as cache, cache.transact():
+            name = 'normal-completion-guard:v1:' + key
+            streak = min(threshold, cache.get(name, 0) + 1) if normal else 0
+            cache.set(name, streak)
+            return streak
 
     def retire_session(self, key, expected_session_id):
         """Retire only the session that actually received the upstream refusal.
@@ -57,6 +81,75 @@ class SharedRuntimeState:
     def _set(self, key, value, ttl):
         with Cache(self.directory) as cache:
             cache.set('response:'+key, value, expire=max(ttl, 0.01))
+
+    def _live_response_members(self, members):
+        live = []
+        for token in members:
+            lock = FileLock(self.waiter_locks / (token + '.lock'), thread_local=False, mode=0o600)
+            try:
+                lock.acquire(timeout=0)
+            except Timeout:
+                live.append(token)
+            else:
+                lock.release()
+                Path(lock.lock_file).unlink(missing_ok=True)
+        return live
+
+    @staticmethod
+    def _discard_unsuccessful_response(cache, key):
+        cached = cache.get('response:' + key)
+        if cached is not None and not response_can_replay(cached):
+            cache.delete('response:' + key)
+
+    def join_response(self, key):
+        """A live HTTP waiter owns a kernel lock, not an expiring heartbeat.
+
+        Separate UUID files work across container PID namespaces. A crashed
+        process releases its locks automatically; observers prune only locks
+        they can actually acquire, never a slow but still-live subscriber.
+        """
+        token = uuid.uuid4().hex
+        lock = FileLock(self.waiter_locks / (token + '.lock'), thread_local=False, mode=0o600)
+        lock.acquire(timeout=0)
+        try:
+            with Cache(self.directory) as cache, cache.transact():
+                members = self._live_response_members(cache.get('response-waiters:' + key, []))
+                if not members:
+                    # Also evict empty responses written by an older release,
+                    # or left behind by a crashed cohort. Never evict while
+                    # live waiters still need that result: doing so would make
+                    # a concurrent follower send another paid request.
+                    self._discard_unsuccessful_response(cache, key)
+                cache.set('response-waiters:' + key, [*members, token])
+        except BaseException:
+            lock.release()
+            Path(lock.lock_file).unlink(missing_ok=True)
+            raise
+        return token, lock
+
+    def leave_response(self, key, lease):
+        token, lock = lease
+        try:
+            with Cache(self.directory) as cache, cache.transact():
+                members = [x for x in cache.get('response-waiters:' + key, []) if x != token]
+                if members:
+                    cache.set('response-waiters:' + key, members)
+                else:
+                    cache.delete('response-waiters:' + key)
+                    self._discard_unsuccessful_response(cache, key)
+        finally:
+            lock.release()
+            Path(lock.lock_file).unlink(missing_ok=True)
+
+    def response_waiters(self, key):
+        with Cache(self.directory) as cache, cache.transact():
+            members = cache.get('response-waiters:' + key, [])
+            live = self._live_response_members(members)
+            if live:
+                cache.set('response-waiters:' + key, live)
+            else:
+                cache.delete('response-waiters:' + key)
+            return len(live)
 
     async def exact_response(self, key, ttl, runner):
         # Bounded lock files; a rare hash collision serializes requests safely.

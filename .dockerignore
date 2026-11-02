@@ -23,3 +23,5 @@ deploy/state/
 **/*.db
 .venv/
 venv/
+tests/
+tools/

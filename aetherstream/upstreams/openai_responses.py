@@ -1,4 +1,5 @@
 import asyncio
+from aetherstream.routing.channel_policy import disconnect_on_early_stop
 import json
 import time
 import uuid
@@ -6,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Callable
 
 import httpx
+import anyio
+from aetherstream.streaming.upstream_close import close_open_task
 
 from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME
 from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection
@@ -143,47 +146,7 @@ def _truncate_for_stop_tag(full_response: str, delta: str, find_stop_tag: Callab
     return truncated, clean_delta
 
 
-async def _close_upstream_stream(
-    *,
-    response: httpx.Response | None,
-    client: httpx.AsyncClient | None,
-    deps: ResponsesUpstreamDeps,
-    trace_prefix: str,
-    label: str,
-    reason: str,
-    started_at: float,
-    line_count: int,
-    data_line_count: int,
-    out_chars: int,
-) -> None:
-    close_t0 = time.perf_counter()
-    response_closed = False
-    client_closed = False
-    if response is not None:
-        try:
-            await response.aclose()
-            response_closed = True
-        except Exception as e:
-            deps.log(
-                f"{trace_prefix}{label}_upstream_close_response_error "
-                f"reason={reason} type={type(e).__name__} err={e}"
-            )
-    if client is not None:
-        try:
-            await client.aclose()
-            client_closed = True
-        except Exception as e:
-            deps.log(
-                f"{trace_prefix}{label}_upstream_close_client_error "
-                f"reason={reason} type={type(e).__name__} err={e}"
-            )
-    deps.log(
-        f"{trace_prefix}{label}_upstream_close "
-        f"reason={reason} response_closed={str(response_closed).lower()} "
-        f"client_closed={str(client_closed).lower()} close_elapsed={deps.fmt_ms(close_t0)} "
-        f"elapsed={deps.fmt_ms(started_at)} lines={line_count} "
-        f"data_lines={data_line_count} out_chars={out_chars}"
-    )
+from aetherstream.streaming.upstream_close import close_upstream_stream as _close_upstream_stream
 
 
 async def forward_responses_as_chat_stream(
@@ -199,6 +162,7 @@ async def forward_responses_as_chat_stream(
     timeout: httpx.Timeout,
     max_raw_sse_bytes: int,
     deps: ResponsesUpstreamDeps,
+    request_headers: dict | None = None,
 ) -> AsyncGenerator[bytes, None]:
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
@@ -272,6 +236,7 @@ async def forward_responses_as_chat_stream(
         "Accept": "text/event-stream",
         "User-Agent": f"StreamProxy/1.0 OpenAI-Responses/{model}",
     }
+    headers.update(request_headers or {})
 
     async def open_upstream() -> tuple[httpx.AsyncClient, Any, httpx.Response]:
         client = httpx.AsyncClient(timeout=timeout, http2=True)
@@ -285,8 +250,9 @@ async def forward_responses_as_chat_stream(
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
             return client, cm, response
-        except Exception:
-            await client.aclose()
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await client.aclose()
             raise
 
     upstream_task: asyncio.Task | None = None
@@ -524,6 +490,19 @@ async def forward_responses_as_chat_stream(
                             delta,
                             deps.find_stop_tag,
                         )
+                        finish_status = "early_stop_tag"
+                        await _close_upstream_stream(
+                            response=response,
+                            client=client,
+                            deps=deps,
+                            trace_prefix=trace_prefix,
+                            label="early_stop",
+                            reason="responses_stream_stop_tag",
+                            started_at=request_t0,
+                            line_count=line_count,
+                            data_line_count=data_line_count,
+                            out_chars=len(full_response),
+                        )
                         if clean_delta:
                             chunk = _build_openai_chunk(
                                 stream_id=stream_id,
@@ -544,18 +523,8 @@ async def forward_responses_as_chat_stream(
                             raw_sse="\n".join(raw_sse_lines),
                         )
                         finish_status = "early_stop_tag"
-                        await _close_upstream_stream(
-                            response=response,
-                            client=client,
-                            deps=deps,
-                            trace_prefix=trace_prefix,
-                            label="early_stop",
-                            reason="responses_stream_stop_tag",
-                            started_at=request_t0,
-                            line_count=line_count,
-                            data_line_count=data_line_count,
-                            out_chars=len(full_response),
-                        )
+                        if disconnect_on_early_stop():
+                            return
                         yield f"data: {json.dumps(stop_chunk, ensure_ascii=True)}\n\n".encode()
                         yield emit_done()
                         return
@@ -650,6 +619,7 @@ async def forward_responses_as_chat_stream(
                         full_response or "[empty response]",
                         raw_sse="\n".join(raw_sse_lines),
                     )
+                    stop_chunk["usage"] = final_usage
                     finish_status = "responses_response_completed"
                     last_downstream_emit = time.perf_counter()
                     yield f"data: {json.dumps(stop_chunk, ensure_ascii=True)}\n\n".encode()
@@ -717,6 +687,11 @@ async def forward_responses_as_chat_stream(
         yield deps.build_openai_sse_error(502, str(e), "responses_upstream_proxy_error")
         yield emit_done()
     finally:
+        await close_open_task(
+            upstream_task, deps=deps, trace_prefix=trace_prefix,
+            label="cleanup", reason=finish_status, started_at=request_t0,
+            line_count=line_count, data_line_count=data_line_count, out_chars=len(full_response),
+        )
         if not saved_log:
             if finish_status == "unknown":
                 finish_status = "generator_finalized_without_terminal_event"
@@ -888,6 +863,7 @@ async def collect_responses_nonstream(
     timeout: httpx.Timeout,
     deps: ResponsesUpstreamDeps,
     save_log: bool = True,
+    request_headers: dict | None = None,
 ) -> tuple[str, dict[str, Any], str, str, list[dict[str, Any]]]:
     """Call OpenAI Responses upstream as true non-stream JSON and extract assistant text."""
     request_t0 = time.perf_counter()
@@ -900,6 +876,7 @@ async def collect_responses_nonstream(
         "Accept": "application/json",
         "User-Agent": f"StreamProxy/1.0 OpenAI-Responses/{model}",
     }
+    headers.update(request_headers or {})
     async with httpx.AsyncClient(timeout=timeout, http2=True) as client:
         upstream_t0 = time.perf_counter()
         deps.log(

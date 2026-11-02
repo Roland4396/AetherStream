@@ -4,3 +4,4 @@ httpx[http2]>=0.27,<1.0
 docker>=7.0,<8.0
 filelock==3.32.7
 diskcache==5.6.3
+pypinyin==0.55.0

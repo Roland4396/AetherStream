@@ -1,17 +1,28 @@
 import asyncio
+from aetherstream.routing.channel_policy import disconnect_on_early_stop
 import json
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable
 
 import httpx
+import anyio
+from aetherstream.streaming.upstream_close import close_open_task
 
 from aetherstream.features.early_stop import is_himodels_upstream
+from aetherstream.features.normal_completion_guard import observe_selected_account, observe_natural_finish
 from aetherstream.features.glm_thinking import enforce_glm52_official_thinking
+from aetherstream.features.gemini_anti_route import GeminiAntiRouteSession, apply_gemini_anti_route
 from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME, OpenAIChatTerminalDetector
-from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection
+from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection, upstream_early_stop_enabled
+from aetherstream.upstreams.errors import UpstreamHTTPError
+
+
+# Only an empty, reasoning-only `stop` receives this bounded observation window.
+# Actual resumed output cancels the deadline; this is not a generation timeout.
+REASONING_ONLY_FINISH_GRACE_SEC = 10.0
 
 
 @dataclass
@@ -23,6 +34,8 @@ class ChatCompletionsUpstreamDeps:
     find_stop_tag: Callable[[str], int]
     fmt_ms: Callable[[float, float | None], str]
     release_caller: Callable[[str, str], None]
+    runtime_lookup: Callable[..., Any] | None = None
+    gemini_anti_route: GeminiAntiRouteSession = field(default_factory=GeminiAntiRouteSession)
 
 
 def _extract_openai_content(data: dict) -> str:
@@ -161,57 +174,7 @@ def _truncate_for_stop_tag(
     return full_response[:prefix_pos], clean_delta
 
 
-async def _close_upstream_stream(
-    *,
-    response: httpx.Response | None,
-    client: httpx.AsyncClient | None,
-    deps: ChatCompletionsUpstreamDeps,
-    trace_prefix: str,
-    label: str,
-    reason: str,
-    started_at: float,
-    line_count: int,
-    data_line_count: int,
-    out_chars: int,
-    reader_task: asyncio.Task | None = None,
-) -> None:
-    close_t0 = time.perf_counter()
-    if reader_task is not None and not reader_task.done():
-        reader_task.cancel()
-        try:
-            await reader_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-
-    response_closed = False
-    client_closed = False
-    if response is not None:
-        try:
-            await response.aclose()
-            response_closed = True
-        except Exception as e:
-            deps.log(
-                f"{trace_prefix}{label}_upstream_close_response_error "
-                f"reason={reason} type={type(e).__name__} err={e}"
-            )
-    if client is not None:
-        try:
-            await client.aclose()
-            client_closed = True
-        except Exception as e:
-            deps.log(
-                f"{trace_prefix}{label}_upstream_close_client_error "
-                f"reason={reason} type={type(e).__name__} err={e}"
-            )
-    deps.log(
-        f"{trace_prefix}{label}_upstream_close "
-        f"reason={reason} response_closed={str(response_closed).lower()} "
-        f"client_closed={str(client_closed).lower()} close_elapsed={deps.fmt_ms(close_t0)} "
-        f"elapsed={deps.fmt_ms(started_at)} lines={line_count} "
-        f"data_lines={data_line_count} out_chars={out_chars}"
-    )
+from aetherstream.streaming.upstream_close import close_upstream_stream as _close_upstream_stream
 
 
 async def replay_chat_completions_stream(
@@ -504,9 +467,16 @@ async def forward_chat_completions_stream(
     """
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
+    apply_gemini_anti_route(request_data, deps, model=model, trace_prefix=trace_prefix)
     enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     content_buffer = ""
     full_response = ""
+    reasoning_chars = 0
+    saw_tool_data = False
+    saw_refusal = False
+    deferred_finish: dict[str, Any] | None = None
+    deferred_finish_started = 0.0
+    deferred_finish_deadline = 0.0
     raw_sse_lines: list[str] = []
     raw_sse_size = 0
     raw_sse_truncated = False
@@ -621,6 +591,21 @@ async def forward_chat_completions_stream(
             model=last_chunk_model,
         )
 
+    def finalize_deferred_finish(boundary: str) -> tuple[bytes, bytes]:
+        nonlocal finish_status
+        assert deferred_finish is not None
+        observe_natural_finish(deferred_finish['choices'][0]['finish_reason'])
+        finish_status = f"empty_reasoning_finish:{boundary}"
+        chunks = (emit_data(deferred_finish), emit_done())
+        deps.log(
+            f"{trace_prefix}empty_reasoning_finish_finalized boundary={boundary} "
+            f"waited={deps.fmt_ms(deferred_finish_started)} "
+            f"up_data_lines={data_line_count} out_chars={len(full_response)} "
+            f"reasoning_chars={reasoning_chars}"
+        )
+        persist_stream_log(f"[EMPTY_REASONING_FINISH: {boundary}]")
+        return chunks
+
     def emit_keepalive(reason: str) -> bytes | None:
         nonlocal last_downstream_emit, keepalive_count
         now = time.perf_counter()
@@ -664,8 +649,9 @@ async def forward_chat_completions_stream(
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
             return client, cm, response
-        except Exception:
-            await client.aclose()
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await client.aclose()
             raise
 
     try:
@@ -694,9 +680,7 @@ async def forward_chat_completions_stream(
         deps = scope_stop_detection(deps, response, url, trace_prefix)
 
         try:
-            if is_himodels_upstream(response, url):
-                enable_early_stop = True
-                deps.log(f"{trace_prefix}himodels_early_stop=runtime_config")
+            enable_early_stop = upstream_early_stop_enabled(response, url, enable_early_stop)
             raise_if_superseded()
             if response.status_code != 200:
                 content = await response.aread()
@@ -745,11 +729,20 @@ async def forward_chat_completions_stream(
             try:
                 while True:
                     raise_if_superseded()
+                    wait_timeout = 1.0 if supersede_event is not None else keepalive_interval
+                    if deferred_finish is not None:
+                        remaining = deferred_finish_deadline - time.perf_counter()
+                        # Consume already-read frames before declaring the window empty.
+                        if remaining <= 0 and line_queue.empty():
+                            for chunk in finalize_deferred_finish("grace_expired"):
+                                yield chunk
+                            return
+                        wait_timeout = min(wait_timeout, max(0.001, remaining))
                     try:
-                        queued_line = await asyncio.wait_for(
-                            line_queue.get(),
-                            timeout=1.0 if supersede_event is not None else keepalive_interval,
-                        )
+                        # Keep caller cancellation on this task. wait_for can
+                        # swallow it when a queued get completes at the same time.
+                        async with asyncio.timeout(wait_timeout):
+                            queued_line = await line_queue.get()
                     except asyncio.TimeoutError:
                         raise_if_superseded()
                         keepalive = emit_keepalive("waiting_line")
@@ -799,6 +792,10 @@ async def forward_chat_completions_stream(
                                 yield emit_line(pending_line)
                             pending_tool_lines.clear()
                             saw_done = True
+                            if deferred_finish is not None:
+                                for chunk in finalize_deferred_finish("done"):
+                                    yield chunk
+                                return
                             finish_status = "upstream_done_local_finalized"
                             persist_stream_log("[UPSTREAM_DONE_LOCAL_FINALIZED]")
                             stop_chunk = _build_openai_chunk(
@@ -846,6 +843,38 @@ async def forward_chat_completions_stream(
                                     last_chunk_created = data.get("created")
                                 if data.get("model"):
                                     last_chunk_model = data.get("model")
+
+                                first_choice = (data.get("choices") or [{}])[0]
+                                delta = first_choice.get("delta") or {}
+                                reasoning_delta_chars = sum(
+                                    len(delta[key]) for key in ("reasoning_content", "reasoning")
+                                    if isinstance(delta.get(key), str)
+                                )
+                                reasoning_chars += reasoning_delta_chars
+                                has_tool_data = bool(delta.get("tool_calls") or delta.get("function_call"))
+                                explicit_refusal = bool(delta.get("refusal")) or any(
+                                    isinstance(node.get("stop_details"), dict)
+                                    and node["stop_details"].get("type") == "refusal"
+                                    for node in (data, first_choice, delta)
+                                )
+                                saw_tool_data |= has_tool_data
+                                saw_refusal |= explicit_refusal
+                                if deferred_finish is not None:
+                                    if isinstance(data.get("usage"), dict):
+                                        deferred_finish["usage"] = data["usage"]
+                                    if (delta.get("content") or reasoning_delta_chars
+                                            or has_tool_data or explicit_refusal):
+                                        deps.log(
+                                            f"{trace_prefix}empty_reasoning_finish_resumed "
+                                            f"waited={deps.fmt_ms(deferred_finish_started)} "
+                                            f"content_chars={len(delta.get('content') or '')} "
+                                            f"reasoning_chars={reasoning_delta_chars} "
+                                            f"tool_data={has_tool_data} refusal={explicit_refusal}"
+                                        )
+                                        # The earlier stop was not the actual terminal. Never
+                                        # apply its deadline/usage/completion count to new output.
+                                        deferred_finish = None
+                                        saw_finish_reason = False
 
                                 tool_decision = terminal_detector.feed(data)
                                 if tool_decision.has_tool_data:
@@ -922,10 +951,6 @@ async def forward_chat_completions_stream(
 
                                         content_buffer = content_buffer[:prefix_pos]
                                         full_response = content_buffer
-                                        if clean:
-                                            data["choices"][0]["delta"]["content"] = clean
-                                            yield emit_data(data, ensure_ascii=True)
-
                                         finish_status = "early_stop_tag"
                                         await _close_upstream_stream(
                                             response=response,
@@ -940,6 +965,14 @@ async def forward_chat_completions_stream(
                                             out_chars=len(full_response),
                                             reader_task=reader_task,
                                         )
+                                        if clean:
+                                            data["choices"][0]["delta"]["content"] = clean
+                                            yield emit_data(data, ensure_ascii=True)
+
+                                        finish_status = "early_stop_tag"
+                                        if disconnect_on_early_stop():
+                                            persist_stream_log("[EARLY_STOP: upstream disconnected]")
+                                            return
                                         stop_chunk = _build_openai_chunk(
                                             stream_id=last_chunk_id,
                                             created=last_chunk_created,
@@ -955,6 +988,36 @@ async def forward_chat_completions_stream(
                                     finish_reason = data["choices"][0].get("finish_reason")
                                     if finish_reason:
                                         saw_finish_reason = True
+                                        if (finish_reason == "stop" and not full_response
+                                                and reasoning_chars and not saw_tool_data
+                                                and not saw_refusal and len(data["choices"]) == 1
+                                                and REASONING_ONLY_FINISH_GRACE_SEC > 0):
+                                            if deferred_finish is None:
+                                                deferred_finish = _build_openai_chunk(
+                                                    stream_id=last_chunk_id,
+                                                    created=last_chunk_created,
+                                                    model=last_chunk_model,
+                                                    finish_reason="stop",
+                                                    usage=data.get("usage") if isinstance(data.get("usage"), dict) else None,
+                                                )
+                                                deferred_finish_started = time.perf_counter()
+                                                deferred_finish_deadline = (
+                                                    deferred_finish_started + REASONING_ONLY_FINISH_GRACE_SEC
+                                                )
+                                                deps.log(
+                                                    f"{trace_prefix}empty_reasoning_finish_deferred "
+                                                    f"grace_sec={REASONING_ONLY_FINISH_GRACE_SEC:g} "
+                                                    f"reasoning_chars={reasoning_chars} "
+                                                    f"queued_lines={line_queue.qsize()} reader_done={reader_task.done()}"
+                                                )
+                                            else:
+                                                deps.log(f"{trace_prefix}empty_reasoning_finish_duplicate deadline_unchanged=true")
+                                            if delta:
+                                                content_chunk = json.loads(json.dumps(data))
+                                                content_chunk["choices"][0]["finish_reason"] = None
+                                                yield emit_data(content_chunk, ensure_ascii=False)
+                                            continue
+                                        observe_natural_finish(finish_reason)
                                         finish_status = f"finish_reason_local:{finish_reason}"
                                         choice = data["choices"][0]
                                         delta = choice.get("delta")
@@ -990,6 +1053,10 @@ async def forward_chat_completions_stream(
                 for pending_line in pending_tool_lines:
                     yield emit_line(pending_line)
                 pending_tool_lines.clear()
+                if deferred_finish is not None:
+                    for chunk in finalize_deferred_finish("eof"):
+                        yield chunk
+                    return
                 persist_stream_log("[STREAM_END: no finish_reason detected]")
                 if (upstream_aborted_event or full_response) and not saw_finish_reason and not saw_done:
                     stop_chunk = _build_openai_chunk(
@@ -1070,6 +1137,11 @@ async def forward_chat_completions_stream(
         yield err_bytes
         yield emit_done()
     finally:
+        await close_open_task(
+            upstream_task, deps=deps, trace_prefix=trace_prefix,
+            label="cleanup", reason=finish_status, started_at=request_t0,
+            line_count=line_count, data_line_count=data_line_count, out_chars=len(full_response),
+        )
         if caller_key:
             deps.release_caller(caller_key, trace_id)
         if not saved_log:
@@ -1099,6 +1171,7 @@ async def collect_chat_completions_nonstream(
     """Collect a plain OpenAI-compatible non-stream chat completion."""
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
     request_t0 = time.perf_counter()
+    apply_gemini_anti_route(request_data, deps, trace_prefix=trace_prefix)
     enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     payload = request_data.copy()
     payload["stream"] = False
@@ -1107,6 +1180,7 @@ async def collect_chat_completions_nonstream(
         deps.log(f"{trace_prefix}nonstream_request_start elapsed={deps.fmt_ms(request_t0)}")
         upstream_t0 = time.perf_counter()
         response = await client.post(url, json=payload, headers=headers)
+        observe_selected_account(response)
         deps.log(
             f"{trace_prefix}nonstream_upstream_response status={response.status_code} "
             f"{format_account_pool_route(response)} "
@@ -1114,7 +1188,7 @@ async def collect_chat_completions_nonstream(
         )
         raw_text = response.text
         if response.status_code != 200:
-            raise RuntimeError(f"Upstream error: {response.status_code} - {raw_text}")
+            raise UpstreamHTTPError(response.status_code, raw_text)
         try:
             data = response.json()
         except Exception as exc:
@@ -1124,6 +1198,8 @@ async def collect_chat_completions_nonstream(
     model_name = str(data.get("model") or "") if isinstance(data, dict) else ""
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     finish_reason = _extract_openai_finish_reason(data) or "stop"
+    if isinstance(data, dict) and not data.get('error'):
+        observe_natural_finish(_extract_openai_finish_reason(data))
     deps.log(
         f"{trace_prefix}nonstream_collect_done elapsed={deps.fmt_ms(request_t0)} "
         f"out_chars={len(full_content)}"
@@ -1154,6 +1230,7 @@ async def replay_chat_completions_nonstream_as_stream(
     """
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
+    apply_gemini_anti_route(request_data, deps, model=model, trace_prefix=trace_prefix)
     enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     payload = request_data.copy()
     payload["stream"] = False
@@ -1358,6 +1435,7 @@ async def collect_chat_completions_stream(
     data_line_count = 0
     first_data_time: float | None = None
 
+    apply_gemini_anti_route(request_data, deps, trace_prefix=trace_prefix)
     enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     request_data = request_data.copy()
     request_data["stream"] = True
@@ -1372,9 +1450,7 @@ async def collect_chat_completions_stream(
                 f"{format_account_pool_route(response)} "
                 f"elapsed={deps.fmt_ms(upstream_t0)}"
             )
-            if is_himodels_upstream(response, url):
-                enable_early_stop = True
-                deps.log(f"{trace_prefix}himodels_early_stop=runtime_config")
+            enable_early_stop = upstream_early_stop_enabled(response, url, enable_early_stop)
             if response.status_code != 200:
                 content = await response.aread()
                 error_text = content.decode(errors="replace")

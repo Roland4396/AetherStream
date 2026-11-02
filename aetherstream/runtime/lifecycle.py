@@ -20,6 +20,9 @@ FEATURE_CONTRACTS = {
     'opus_notes': 'request', 'pro_compat': 'request', 'quota_keeper': 'background',
     'replay': 'request', 'request_injections': 'request', 'scene_filter': 'request',
     'stage_warning': 'request', 'terminal_tool': 'request',
+    'normal_completion_guard': 'shared-file',
+    'gemini_anti_route': 'request',
+    'input_transforms': 'request',
 }
 CONTRACT = {'lifecycle': 1, 'api': 1, 'state_read_min': 1, 'state_read_max': 1, 'state_write': 1}
 
@@ -176,11 +179,13 @@ class LifecycleMiddleware:
 # jobs live under this supervisor. Counts make extra tasks in old functions
 # visible too, instead of silently allowing them through the same filename.
 TASK_CONTRACTS = {
+    ('streaming/modes.py', 'replay_json_completion'): (1, 'request-finally'),
     ('features/quota_keeper/service.py', 'start'): (1, 'singleton-lifecycle'),
     ('runtime/lifecycle.py', 'start'): (1, 'supervisor'),
     ('runtime/tasks.py', 'spawn_detached'): (1, 'detached-drain-barrier'),
     ('streaming/state.py', 'register'): (1, 'stream-cancel-drain-barrier'),
     ('streaming/dedupe.py', 'run'): (1, 'coalescer-drain-barrier'),
+    ('streaming/dedupe.py', '_execute'): (1, 'coalescer-owned-finally'),
     ('streaming/json_keepalive.py', '__call__'): (2, 'request-finally'),
     ('api/audio_routes.py', '_send_until_disconnect'): (2, 'request-finally'),
     ('upstreams/openai_responses.py', 'forward_responses_as_chat_stream'): (1, 'request-finally'),

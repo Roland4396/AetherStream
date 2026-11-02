@@ -6,14 +6,18 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from aetherstream.api.dependencies import RouteDependencies, build_route_dependencies
+from aetherstream.routing.account_channels import ChannelUnavailable
 
 
 async def models(request: Request, deps: RouteDependencies):
     """返回本地模型 + 动态上游模型目录。"""
-    directory = await deps.refresh_model_directory(
-        force=True,
-        request_authorization=request.headers.get('authorization', ''),
-    )
+    try:
+        directory = await deps.refresh_model_directory(
+            force=True,
+            request_authorization=request.headers.get('authorization', ''),
+        )
+    except ChannelUnavailable as exc:
+        return JSONResponse({'error': {'type': 'channel_routing_error', 'message': str(exc)}}, status_code=exc.status)
     models_data = directory.get('models')
     if not isinstance(models_data, list):
         models_data = []

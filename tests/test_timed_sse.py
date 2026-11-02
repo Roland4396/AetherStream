@@ -154,18 +154,22 @@ class TimedRouteTests(unittest.IsolatedAsyncioTestCase):
 
         server = await asyncio.start_server(upstream, '127.0.0.1', 0)
         port = server.sockets[0].getsockname()[1]
+        # This case must exercise an established upstream, not expire during
+        # SSL-context initialization on a loaded CI host. Header-wait deadlines
+        # are covered separately by test_timer_includes_handler_wait_before_headers.
+        client = httpx.AsyncClient(trust_env=False)
         async def handler(request, deps):
             async def body():
-                async with httpx.AsyncClient(trust_env=False) as client:
-                    async with client.stream('GET', f'http://127.0.0.1:{port}/') as response:
-                        async for chunk in response.aiter_bytes():
-                            yield chunk
+                async with client.stream('GET', f'http://127.0.0.1:{port}/') as response:
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
             return DisconnectSafeStreamingResponse(body(), media_type='text/event-stream')
         try:
             r, _ = await self.request(handler, {'stream': True}, '?duration_seconds=0.3')
             self.assertEqual(r.content, b'data: first\n\n')
             await asyncio.wait_for(disconnected.wait(), 1)
         finally:
+            await client.aclose()
             server.close()
             await server.wait_closed()
 

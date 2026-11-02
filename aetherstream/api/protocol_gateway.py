@@ -10,6 +10,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from aetherstream.api.chat_routes import chat_completions
+from aetherstream.api.timed_routes import TimedSSEResponse
 from aetherstream.streaming.responses import DisconnectSafeStreamingResponse as StreamingResponse
 from aetherstream.transforms.downstream_protocols import (
     anthropic_to_chat_request,
@@ -57,6 +58,8 @@ def _chat_json_to_responses(data: dict[str, Any], *, fallback_model: str) -> dic
     if isinstance(data.get("error"), dict):
         return data
     choices = data.get("choices") or []
+    interrupted = bool(data.get('proxy_termination')) or bool(
+        choices and choices[0].get('finish_reason') == 'early_stop')
     message = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
     output: list[dict[str, Any]] = []
     content = message.get("content")
@@ -64,7 +67,7 @@ def _chat_json_to_responses(data: dict[str, Any], *, fallback_model: str) -> dic
         output.append({
             "id": f"msg_{uuid.uuid4().hex}",
             "type": "message",
-            "status": "completed",
+            "status": "incomplete" if interrupted else "completed",
             "role": "assistant",
             "content": [{"type": "output_text", "text": content, "annotations": []}],
         })
@@ -78,7 +81,7 @@ def _chat_json_to_responses(data: dict[str, Any], *, fallback_model: str) -> dic
         output.append({
             "id": f"fc_{uuid.uuid4().hex}",
             "type": "function_call",
-            "status": "completed",
+            "status": "incomplete" if interrupted else "completed",
             "call_id": str(call.get("id") or ""),
             "name": str(function.get("name") or ""),
             "arguments": str(function.get("arguments") or ""),
@@ -93,11 +96,13 @@ def _chat_json_to_responses(data: dict[str, Any], *, fallback_model: str) -> dic
         "id": str(data.get("id") or f"resp_{uuid.uuid4().hex}"),
         "object": "response",
         "created_at": int(data.get("created") or 0),
-        "status": "completed",
+        "status": "incomplete" if interrupted else "completed",
         "model": str(data.get("model") or fallback_model),
         "output": output,
         "usage": usage,
         "error": None,
+        **({'incomplete_details': {'reason': 'proxy_early_stop'},
+            'proxy_termination': data.get('proxy_termination')} if interrupted else {}),
     }
 
 
@@ -149,12 +154,14 @@ def _chat_json_to_anthropic(data: dict[str, Any], *, fallback_model: str) -> dic
         "stop_reason": {
             "length": "max_tokens",
             "tool_calls": "tool_use",
+            "early_stop": None,
         }.get(finish_reason, "end_turn"),
         "stop_sequence": None,
         "usage": {
             "input_tokens": int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0),
             "output_tokens": int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0),
         },
+        **({'proxy_termination': data['proxy_termination']} if data.get('proxy_termination') else {}),
     }
 
 
@@ -183,13 +190,21 @@ async def route_protocol_request(request: Request, chat_deps: Any, *, protocol: 
 
     inner_request = _clone_json_request(request, chat_payload)
     response = await chat_completions(inner_request, chat_deps)
+    timed = response if isinstance(response, TimedSSEResponse) else None
+    if timed is not None:
+        response = timed.response
     model = str(payload.get("model") or chat_payload.get("model") or "")
     if isinstance(response, StreamingResponse):
         if protocol == "responses":
-            body = chat_stream_to_responses(response.body_iterator, model=model)
+            body = chat_stream_to_responses(response.body_iterator, model=model, strict_terminal=getattr(response, "channel_managed", False))
         else:
-            body = chat_stream_to_anthropic(response.body_iterator, model=model)
-        return StreamingResponse(body, status_code=response.status_code, media_type="text/event-stream")
+            body = chat_stream_to_anthropic(response.body_iterator, model=model, strict_terminal=getattr(response, "channel_managed", False))
+        converted = StreamingResponse(body, status_code=response.status_code, media_type="text/event-stream",
+                                      on_close=getattr(response, 'on_close', None))
+        if timed is not None:
+            return TimedSSEResponse(converted, deadline=timed.deadline,
+                seconds=timed.headers['x-sse-time-limit'], trace_id=timed.trace_id, deps=timed.deps)
+        return converted
 
     data = _decode_json_response(response)
     if protocol == "responses":

@@ -29,6 +29,7 @@ from aetherstream.api.messages_routes import register_routes as register_message
 from aetherstream.api.responses_routes import register_routes as register_responses_routes
 from aetherstream.api.system_routes import register_routes as register_system_routes
 from aetherstream.api.quota_keeper_routes import register_routes as register_quota_keeper_routes
+from aetherstream.api.request_mode_routes import register_routes as register_request_mode_routes
 from aetherstream.features.quota_keeper import QuotaKeeper
 from aetherstream.features.gproxy_oauth import GproxyOAuthRecovery
 from aetherstream.runtime.lifecycle import RuntimeLifecycle, LifecycleMiddleware
@@ -40,7 +41,7 @@ from aetherstream.config.urls import (
     normalize_openai_chat_base_url,
 )
 from aetherstream.runtime.docker_control import DockerContainerRestarter
-from aetherstream.runtime.flags import RuntimeFlags
+from aetherstream.runtime.flags import RuntimeFlags, read_flags
 from aetherstream.upstreams.anthropic_messages import AnthropicMessagesDeps, forward_anthropic_messages_stream
 from aetherstream.upstreams.anthropic_messages import (
     collect_anthropic_messages_as_chat_completion,
@@ -59,6 +60,8 @@ from aetherstream.upstreams.gemini_generate_content import (
     forward_gemini_generate_content_stream,
 )
 from aetherstream.routing.model_policy import ModelPolicy, OPENAI_SUBSCRIPTION_MODELS
+from aetherstream.routing import account_channels, policy_config
+from aetherstream.routing.channel_policy import runtime_value, MISSING
 from aetherstream.upstreams.openai_chat_completions import (
     ChatCompletionsUpstreamDeps,
     collect_chat_completions_nonstream,
@@ -393,6 +396,7 @@ def get_openai_compatible_upstreams() -> list[dict[str, Any]]:
             'api_key': api_key,
             'api_key_env': api_key_env,
             'include_models': _coerce_string_list(item.get('include_models'), []),
+            'discover_models': _coerce_bool(item.get('discover_models'), False),
             'include_model_families': _coerce_string_list(item.get('include_model_families'), []),
             'inject_opus_note': _coerce_bool(item.get('inject_opus_note'), False),
             'drop_request_fields': _coerce_string_list(item.get('drop_request_fields'), []),
@@ -536,6 +540,9 @@ async def refresh_model_directory(
 ) -> dict[str, object]:
     global _model_directory_cache
 
+    if account_routing_enabled():
+        return await refresh_account_catalog(request_authorization)
+
     now = time.monotonic()
     auth_mode = "request-auth" if str(request_authorization or "").strip() else "no-auth"
     if (
@@ -582,9 +589,9 @@ async def refresh_model_directory(
             name = upstream['name']
             base_url = upstream['base_url']
             include_models = upstream.get('include_models')
-            if isinstance(include_models, list) and include_models:
+            if not upstream.get('discover_models', False) or (isinstance(include_models, list) and include_models):
                 upstream_model_count = 0
-                for model_id in include_models:
+                for model_id in include_models or []:
                     model_id = str(model_id or '').strip()
                     if not model_id or not _upstream_allows_model(upstream, model_id):
                         continue
@@ -1270,6 +1277,8 @@ def log(msg: str):
 
 shared_runtime_state = (SharedRuntimeState(os.environ['STREAM_SHARED_STATE_DIR'])
                         if os.environ.get('STREAM_SHARED_STATE_DIR') else None)
+from aetherstream.features.normal_completion_guard import NormalCompletionGuard
+normal_completion_guard = NormalCompletionGuard(shared_runtime_state)
 active_stream_registry = ActiveStreamRegistry(log=proxy_logger.log, shared_state=shared_runtime_state)
 
 nonstream_coalescer = ExactRequestCoalescer(
@@ -1287,7 +1296,24 @@ runtime_flags = RuntimeFlags(
 
 
 def _runtime_lookup(*keys):
-    return runtime_flags.lookup(*keys)
+    scoped = runtime_value(*keys)
+    return runtime_flags.lookup(*keys) if scoped is MISSING else scoped
+
+
+def account_routing_enabled() -> bool:
+    return account_channels.enabled(_runtime_lookup)
+
+
+async def resolve_account_route(model: str, request_authorization: str = "") -> dict:
+    return await account_channels.resolve(_runtime_lookup, model, request_authorization)
+
+
+async def refresh_account_catalog(request_authorization: str = "") -> dict:
+    return await account_channels.catalog(_runtime_lookup, request_authorization)
+
+
+async def build_account_dedupe(plan: dict, payload: dict, headers: dict) -> dict:
+    return await account_channels.dedupe_key(_runtime_lookup, plan, payload, headers)
 
 
 quota_keeper = QuotaKeeper(
@@ -1313,9 +1339,12 @@ def validate_release_readiness():
     # A malformed new config must fail readiness rather than relying on stale
     # cached defaults when promoting a new instance.
     if os.path.isfile(RUNTIME_FLAGS_PATH):
-        with open(RUNTIME_FLAGS_PATH, encoding='utf-8') as file:
-            if not isinstance(json.load(file), dict):
-                raise ValueError('Runtime flags must be an object')
+        value, _, _ = read_flags(RUNTIME_FLAGS_PATH)
+        if value.get('account_routing', {}).get('enabled') is True:
+            account_channels.connection(lambda *keys: value.get(keys[0]))
+        if 'channel_policies' in value:
+            lookup = lambda *keys: value.get(keys[0])
+            policy_config.validate_config(value['channel_policies'], policy_config.global_policy(lookup))
 
 
 runtime_lifecycle = RuntimeLifecycle(
@@ -1598,6 +1627,7 @@ def build_chat_completions_upstream_deps() -> ChatCompletionsUpstreamDeps:
         find_stop_tag=find_stop_tag,
         fmt_ms=fmt_ms,
         release_caller=release_active_stream_caller,
+        runtime_lookup=_runtime_lookup,
     )
 
 
@@ -1859,6 +1889,7 @@ def build_gemini_generate_content_deps() -> GeminiGenerateContentDeps:
         log=log,
         save_request_log=save_request_log,
         build_openai_sse_error=build_openai_sse_error,
+        runtime_lookup=_runtime_lookup,
     )
 
 
@@ -1871,6 +1902,13 @@ admin_route_dependencies = register_admin_routes(app, ctx=globals())
 register_quota_keeper_routes(
     app, keeper=quota_keeper,
     admin_token_file=os.environ.get('QUOTA_KEEPER_ADMIN_TOKEN_FILE', ''),
+)
+register_request_mode_routes(
+    app, runtime_flags=runtime_flags,
+    token_file=os.environ.get('STREAM_ADMIN_TOKEN_FILE', os.environ.get('QUOTA_KEEPER_ADMIN_TOKEN_FILE', '')),
+    backup_dir=os.path.join(os.environ.get('STREAM_SHARED_STATE_DIR', os.path.join(LOG_DIR, '.runtime')),
+                            'request-mode-backups'),
+    catalog=refresh_account_catalog, resolve_route=resolve_account_route, log=log,
 )
 
 

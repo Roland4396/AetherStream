@@ -1,4 +1,6 @@
 import asyncio
+from aetherstream.routing.channel_policy import disconnect_on_early_stop
+from aetherstream.streaming.upstream_close import close_upstream_stream as _close_upstream_stream
 import json
 import time
 import uuid
@@ -11,6 +13,7 @@ from aetherstream.observability.refusals import AnthropicRefusalDiagnostics
 from aetherstream.runtime.tasks import spawn_detached
 
 from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME
+from aetherstream.features.normal_completion_guard import observe_natural_finish
 from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection
 
 from .cache import (
@@ -152,40 +155,15 @@ async def forward_anthropic_messages_as_chat_stream(
         reason: str,
     ) -> None:
         nonlocal upstream_closed_by_proxy
-        close_t0 = time.perf_counter()
         upstream_closed_by_proxy = True
-        if reader_task is not None and not reader_task.done():
-            reader_task.cancel()
-            try:
-                await reader_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-        response_closed = False
-        client_closed = False
-        try:
-            await response.aclose()
-            response_closed = True
-        except Exception as e:
-            deps.log(
-                f"{trace_prefix}early_stop_upstream_close_response_error "
-                f"reason={reason} type={type(e).__name__} err={e}"
-            )
-        try:
-            await client.aclose()
-            client_closed = True
-        except Exception as e:
-            deps.log(
-                f"{trace_prefix}early_stop_upstream_close_client_error "
-                f"reason={reason} type={type(e).__name__} err={e}"
-            )
-        deps.log(
-            f"{trace_prefix}early_stop_upstream_close "
-            f"reason={reason} response_closed={str(response_closed).lower()} "
-            f"client_closed={str(client_closed).lower()} elapsed={deps.fmt_ms(close_t0)} "
-            f"lines={line_count} data_lines={data_line_count} out_chars={len(full_response)}"
+        await _close_upstream_stream(
+            response=response, client=client, deps=deps, trace_prefix=trace_prefix,
+            label="early_stop", reason=reason, started_at=request_t0,
+            line_count=line_count, data_line_count=data_line_count,
+            out_chars=len(full_response), reader_task=reader_task,
         )
+        if disconnect_on_early_stop():
+            return
 
     try:
         if caller_key:
@@ -517,12 +495,10 @@ async def forward_anthropic_messages_as_chat_stream(
                                 yield f"data: {json.dumps(role_chunk, ensure_ascii=True)}\n\n".encode()
                                 last_downstream_emit = time.perf_counter()
                                 sent_role_chunk = True
-                            continue
 
-                        if event_type == "content_block_start":
-                            block = data.get("content_block")
-                            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                                continue
+                        block = data.get("content_block")
+                        if (event_type == "content_block_start" and isinstance(block, dict)
+                                and block.get("type") == "tool_use"):
                             block_index = int(data.get("index") or 0)
                             tool_name = str(block.get("name") or "")
                             if tool_name == TERMINAL_TOOL_NAME:
@@ -591,7 +567,7 @@ async def forward_anthropic_messages_as_chat_stream(
                             last_downstream_emit = time.perf_counter()
                             continue
 
-                        if event_type == "content_block_delta":
+                        if event_type in {"message_start", "content_block_start", "content_block_delta"}:
                             block_index = int(data.get("index") or 0)
                             raw_delta = data.get("delta")
                             if isinstance(raw_delta, dict) and raw_delta.get("type") == "input_json_delta":
@@ -645,6 +621,13 @@ async def forward_anthropic_messages_as_chat_stream(
                                     delta,
                                     deps.find_stop_tag,
                                 )
+                                finish_status = "early_stop_tag"
+                                await close_upstream_for_early_stop(
+                                    response=response,
+                                    client=client,
+                                    reader_task=upstream_reader,
+                                    reason="stop_tag",
+                                )
                                 if clean_delta:
                                     chunk = _build_openai_chunk(
                                         stream_id=stream_id,
@@ -672,12 +655,8 @@ async def forward_anthropic_messages_as_chat_stream(
                                     trace_id=trace_id,
                                 )
                                 finish_status = "early_stop_tag"
-                                await close_upstream_for_early_stop(
-                                    response=response,
-                                    client=client,
-                                    reader_task=upstream_reader,
-                                    reason="stop_tag",
-                                )
+                                if disconnect_on_early_stop():
+                                    return
                                 yield f"data: {json.dumps(stop_chunk, ensure_ascii=True)}\n\n".encode()
                                 last_downstream_emit = time.perf_counter()
                                 yield emit_done()
@@ -702,6 +681,7 @@ async def forward_anthropic_messages_as_chat_stream(
                             continue
 
                         if event_type == "message_stop":
+                            observe_natural_finish(stop_reason, error=bool(upstream_error_event_count))
                             if deps.retire_refused_session(stop_reason, trace_prefix):
                                 _cancel_claude_cache_post_keepalive(
                                     post_key=cache_post_keepalive_key,
@@ -728,6 +708,7 @@ async def forward_anthropic_messages_as_chat_stream(
                                 request_payload=request_data,
                                 trace_id=trace_id,
                             )
+                            stop_chunk["usage"] = usage
                             finish_status = f"message_stop:{stop_reason or 'stop'}"
                             yield f"data: {json.dumps(stop_chunk, ensure_ascii=True)}\n\n".encode()
                             last_downstream_emit = time.perf_counter()
