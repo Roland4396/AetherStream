@@ -16,6 +16,7 @@ from aetherstream.features.normal_completion_guard import observe_selected_accou
 from aetherstream.features.glm_thinking import enforce_glm52_official_thinking
 from aetherstream.features.gemini_anti_route import GeminiAntiRouteSession, apply_gemini_anti_route
 from aetherstream.features.terminal_tool import TERMINAL_TOOL_NAME, OpenAIChatTerminalDetector
+from aetherstream.features.output_tool import OutputToolStreamDecoder, unwrap_completion, record_marker
 from aetherstream.upstreams.route_logging import format_account_pool_route, scope_stop_detection, upstream_early_stop_enabled
 from aetherstream.upstreams.errors import UpstreamHTTPError
 
@@ -456,6 +457,7 @@ async def forward_chat_completions_stream(
     caller_key: str = "",
     caller_desc: str = "",
     supersede_event: asyncio.Event | None = None,
+    output_tool: dict | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """OpenAI-compatible streaming forwarder with downstream keepalive.
 
@@ -467,6 +469,7 @@ async def forward_chat_completions_stream(
     """
     request_t0 = time.perf_counter()
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
+    output_decoder = OutputToolStreamDecoder(output_tool) if output_tool is not None else None
     apply_gemini_anti_route(request_data, deps, model=model, trace_prefix=trace_prefix)
     enforce_glm52_official_thinking(request_data, log=deps.log, trace_prefix=trace_prefix)
     content_buffer = ""
@@ -520,7 +523,7 @@ async def forward_chat_completions_stream(
                 messages,
                 response_text,
                 stream=True,
-                raw_sse="\n".join(raw_sse_lines),
+                raw_sse=record_marker(output_tool) + "\n".join(raw_sse_lines),
                 request_payload=request_data,
                 trace_id=trace_id,
             )
@@ -811,6 +814,9 @@ async def forward_chat_completions_stream(
                         if json_str:
                             try:
                                 data = json.loads(json_str)
+                                if output_decoder is not None:
+                                    data = output_decoder.feed(data)
+                                    line = 'data: ' + json.dumps(data, ensure_ascii=False)
 
                                 if isinstance(data.get("error"), dict):
                                     err = data["error"]
@@ -1167,6 +1173,7 @@ async def collect_chat_completions_nonstream(
     timeout: httpx.Timeout,
     deps: ChatCompletionsUpstreamDeps,
     trace_id: str = "",
+    output_tool: dict | None = None,
 ) -> tuple[str, str, dict, str, str, dict[str, Any]]:
     """Collect a plain OpenAI-compatible non-stream chat completion."""
     trace_prefix = f"[TRACE {trace_id}] " if trace_id else ""
@@ -1194,6 +1201,7 @@ async def collect_chat_completions_nonstream(
         except Exception as exc:
             raise RuntimeError(f"Upstream returned non-JSON response: {raw_text[:4000]}") from exc
 
+    data = unwrap_completion(data, output_tool)
     full_content = _extract_openai_message_content(data)
     model_name = str(data.get("model") or "") if isinstance(data, dict) else ""
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}

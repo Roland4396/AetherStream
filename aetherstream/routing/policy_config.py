@@ -95,6 +95,8 @@ def validate_policy(policy: Any) -> None:
     # Existing schema-1 readers ignore new request-runtime feature settings,
     # so config and shared state both remain usable during rollback.
     runtime = policy.get('runtime', {})
+    if isinstance(runtime, dict) and 'output_tool' in runtime:
+        raise RegistryError('Configure output_tool at the runtime root, not inside channel policies')
     guard = runtime.get('normal_completion_guard', {}) if isinstance(runtime, dict) else {}
     if not isinstance(guard, dict) or set(guard) - {'enabled', 'scope', 'threshold', 'account_ids'}:
         raise RegistryError('invalid normal_completion_guard policy')
@@ -178,6 +180,16 @@ def validate_config(cfg, globals_):
 
 
 def global_policy(lookup):
+    # An old slot must not hash an unknown format-only feature into JSON locks.
+    # Keep its config outside the legacy policy projection; attach a selected
+    # request snapshot below, and remove that snapshot from transport identities.
+    output_tool = lookup('output_tool')
+    if output_tool is not None:
+        from aetherstream.features.output_tool import validate_settings
+        try:
+            validate_settings(output_tool)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RegistryError('invalid output_tool configuration: ' + str(exc)) from exc
     value = {k: copy.deepcopy(lookup(k)) for k in ('early_stop','streaming','filters')
              if lookup(k) is not None}
     value['runtime'] = {k: copy.deepcopy(lookup(k)) for k in ('claude','injections')
@@ -211,6 +223,10 @@ def enrich_selection(lookup, selection):
     mode = request_mode.resolve(cfg, cid, upstream)
     policy.setdefault('streaming', {})['force_upstream'] = mode['mode']
     policy['streaming'].pop('nonstream_to_stream', None)
+    from aetherstream.features.output_tool import selected_settings
+    output_tool = selected_settings(lookup('output_tool'), upstream, selection['transport'])
+    if output_tool is not None:
+        policy.setdefault('runtime', {})['output_tool'] = output_tool
     if policy.get('session', {}).get('model') == '$upstream':policy['session']['model'] = upstream
     policy['account_overrides'] = copy.deepcopy(cfg.get('account_overrides', {}))
     policy['_local_policy'] = True
@@ -218,7 +234,10 @@ def enrich_selection(lookup, selection):
     if dedupe.get('model') == '$upstream':dedupe['model'] = upstream
     elif dedupe.get('model') == '$public':dedupe['model'] = selection['model']
     if dedupe.get('gemini_payload') and 'gemini' in upstream.lower():dedupe.update(kind='payload', shape='chat')
-    revision = hashlib.sha256(json.dumps({'config':cfg,'globals':globals_}, sort_keys=True,
+    revision_input = {'config': cfg, 'globals': globals_}
+    if output_tool is not None:
+        revision_input['output_tool'] = output_tool
+    revision = hashlib.sha256(json.dumps(revision_input, sort_keys=True,
                                          ensure_ascii=False,separators=(',', ':')).encode()).hexdigest()[:20]
     return {**selection, 'policy':policy, 'policy_revision':revision, 'request_mode':mode, '_local_dedupe':True,
             'dedupe':dedupe, 'dedupe_credentials':copy.deepcopy(cfg.get('dedupe_credentials', {}))}

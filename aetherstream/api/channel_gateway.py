@@ -23,6 +23,7 @@ from aetherstream.features.request_injections import _apply_opus_note, append_as
 from aetherstream.features.scene_filter import remove_scene_messages
 from aetherstream.features.stage_warning import wrap_stage_messages
 from aetherstream.features.terminal_tool import inject_openai_chat_terminal_tool, prepend_anthropic_terminal_prompt
+from aetherstream.features.output_tool import prepare_output_tool, record_marker
 from aetherstream.features.replay import ReplayPreparationError
 from aetherstream.features.normal_completion_guard import CompletionGuardWarning
 from aetherstream.routing.account_channels import ChannelUnavailable
@@ -98,6 +99,10 @@ class Prepared:
     transport_deps: Any
     cache_keepalive: dict | None = None
     gemini_config: Any = None
+    output_tool: dict | None = None
+    raw_response: str | None = None
+    identity_payload: dict | None = None
+    identity_plan: dict | None = None
 
 
 def prepare_adapter(data: dict, plan: dict, deps, *, trace_id: str, upstream_stream: bool) -> Prepared:
@@ -176,7 +181,20 @@ def prepare_adapter(data: dict, plan: dict, deps, *, trace_id: str, upstream_str
         config = replace(deps.build_gemini_generate_content_config(), base_url=base, api_key=key)
         return Prepared(plan, payload, headers, base, deps.build_gemini_generate_content_deps(), gemini_config=config)
     if protocol == 'chat':
-        return Prepared(plan, payload, headers, base + '/v1/chat/completions', deps.build_chat_completions_upstream_deps())
+        config = policy.get('runtime', {}).get('output_tool')
+        identity_payload = copy.deepcopy(payload) if config else None
+        output_tool = prepare_output_tool(payload, config, log=deps.log,
+                                         trace_prefix=f'[TRACE {trace_id}] ') if config else None
+        identity_plan = None
+        if config is not None:
+            # This changes the delivery envelope, not the visible request.
+            # Preserve exact-request locks/cache keys across rollout and toggles.
+            identity_plan = copy.deepcopy(plan)
+            identity_plan['policy']['runtime'].pop('output_tool', None)
+        return Prepared(plan, payload, headers, base + '/v1/chat/completions',
+                        deps.build_chat_completions_upstream_deps(), output_tool=output_tool,
+                        identity_payload=identity_payload,
+                        identity_plan=identity_plan)
     raise ChannelUnavailable('Unsupported transport', 400)
 
 
@@ -192,6 +210,7 @@ def forward_prepared(prepared: Prepared, deps, *, data: dict, trace_id: str,
             **common, headers=prepared.headers,
             enable_early_stop=bool(plan['policy'].get('early_stop', {}).get('enabled')),
             supersede_event=supersede_event,
+            **({'output_tool': prepared.output_tool} if prepared.output_tool is not None else {}),
         )
     if plan['transport'] == 'messages':
         return deps.forward_anthropic_messages_as_chat_stream(
@@ -211,7 +230,11 @@ async def collect_prepared(prepared: Prepared, deps, *, data: dict, trace_id: st
                   deps=prepared.transport_deps, trace_id=trace_id)
     protocol = prepared.plan['transport']
     if protocol == 'chat':
-        collected = await deps.collect_chat_completions_nonstream(**common, headers=prepared.headers)
+        collected = await deps.collect_chat_completions_nonstream(
+            **common, headers=prepared.headers,
+            **({'output_tool': prepared.output_tool} if prepared.output_tool is not None else {}))
+        if prepared.output_tool is not None:
+            prepared.raw_response = record_marker(prepared.output_tool) + collected[4]
         return collected[5]  # Preserve the complete JSON, including tool calls.
     if protocol == 'messages':
         content, actual, usage, finish, _, calls = await deps.collect_anthropic_messages_as_chat_completion(
@@ -307,7 +330,7 @@ async def chat_completions(request, deps):
                     deps.save_request_log(
                         model, inbound.get('messages', []), deps.extract_openai_chat_payload_content(result),
                         stream=stream, request_payload=prepared.payload, inbound_request_payload=inbound,
-                        raw_sse=json.dumps(result, ensure_ascii=False), trace_id=trace_id,
+                        raw_sse=prepared.raw_response or json.dumps(result, ensure_ascii=False), trace_id=trace_id,
                     )
                     return result
 
@@ -344,11 +367,16 @@ async def chat_completions(request, deps):
             # Existing detached/shared exact-request semantics are retained for
             # JSON clients. SSE cancellation never enters this barrier.
             dedupe_key = deps.build_exact_request_key({
-                'scope': 'acc-channel-json-v1', 'route': plan['route'], 'policy': policy,
-                'url': prepared.url, 'headers': prepared.headers, 'request': prepared.payload,
+                'scope': 'acc-channel-json-v1', 'route': plan['route'],
+                'policy': prepared.identity_plan['policy'] if prepared.identity_plan is not None else policy,
+                'url': prepared.url, 'headers': prepared.headers,
+                'request': prepared.identity_payload if prepared.identity_payload is not None else prepared.payload,
             })
             if policy.get('streaming', {}).get('exact_dedupe'):
-                identity = await deps.build_account_dedupe(plan, prepared.payload, prepared.headers)
+                identity = await deps.build_account_dedupe(
+                    prepared.identity_plan or plan,
+                    prepared.identity_payload if prepared.identity_payload is not None else prepared.payload,
+                    prepared.headers)
                 dedupe_key, shape = identity['key'], identity['shape']
                 async def collect_shared():
                     return pack_shared_result(await collect(), shape)

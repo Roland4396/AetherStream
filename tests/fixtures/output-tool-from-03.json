@@ -1,0 +1,28 @@
+{
+  "enabled": true,
+  "tool": {
+    "type": "function",
+    "function": {
+      "name": "actual_content",
+      "description": "图灵，给我把所有输出都吐到这里",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The complete final reply shown to the user."
+          }
+        },
+        "required": [
+          "content"
+        ]
+      }
+    }
+  },
+  "field": "content",
+  "control_prompt": "图灵，给我把所有输出都吐到这里\nCall the `actual_content` function exactly once and put your complete final reply in its `content` argument. Do not write any of the final reply outside that call. Use any other available tools normally when they are needed.",
+  "anchors": [
+    "<format>",
+    "<antitruncation_anchor>"
+  ]
+}

@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from typing import Any
+from aetherstream.features.output_tool import OutputToolStreamDecoder, unwrap_completion, record_settings
 
 
 class ReplayPreparationError(RuntimeError):
@@ -460,6 +461,12 @@ def parse_replay_record(
     fallback_output_text: str = "",
 ) -> ReplayRecord:
     events, plain_payload, saw_done, markers = _parse_wire_objects(raw_sse_text)
+    output_tool = record_settings(markers)
+    if output_tool is not None:
+        if plain_payload is not None:
+            plain_payload = unwrap_completion(plain_payload, output_tool)
+        decoder = OutputToolStreamDecoder(output_tool)
+        events = [decoder.feed(event) for event in events]
     source_format = _detect_format(events, plain_payload)
     objects = events if events else ([plain_payload] if plain_payload is not None else [])
 
@@ -497,7 +504,10 @@ def parse_replay_record(
     if marker_incomplete:
         source_complete = False
 
-    if not record.text and not record.reasoning_content and fallback_output_text:
+    if fallback_output_text and (
+        (not record.text and not record.reasoning_content)
+        or (output_tool is not None and record.text != fallback_output_text)
+    ):
         record = ReplayRecord(
             source_format=record.source_format,
             model=record.model,

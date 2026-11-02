@@ -23,6 +23,7 @@ FEATURE_CONTRACTS = {
     'normal_completion_guard': 'shared-file',
     'gemini_anti_route': 'request',
     'input_transforms': 'request',
+    'output_tool': 'request',
 }
 CONTRACT = {'lifecycle': 1, 'api': 1, 'state_read_min': 1, 'state_read_max': 1, 'state_write': 1}
 
