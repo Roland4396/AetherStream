@@ -816,6 +816,8 @@ async def forward_chat_completions_stream(
                                 data = json.loads(json_str)
                                 if output_decoder is not None:
                                     data = output_decoder.feed(data)
+                                    if data is None:
+                                        continue
                                     line = 'data: ' + json.dumps(data, ensure_ascii=False)
 
                                 if isinstance(data.get("error"), dict):

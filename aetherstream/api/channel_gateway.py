@@ -24,6 +24,7 @@ from aetherstream.features.scene_filter import remove_scene_messages
 from aetherstream.features.stage_warning import wrap_stage_messages
 from aetherstream.features.terminal_tool import inject_openai_chat_terminal_tool, prepend_anthropic_terminal_prompt
 from aetherstream.features.output_tool import prepare_output_tool, record_marker
+from aetherstream.features.kunlun_linux import prepare_kunlun_linux
 from aetherstream.features.replay import ReplayPreparationError
 from aetherstream.features.normal_completion_guard import CompletionGuardWarning
 from aetherstream.routing.account_channels import ChannelUnavailable
@@ -181,16 +182,23 @@ def prepare_adapter(data: dict, plan: dict, deps, *, trace_id: str, upstream_str
         config = replace(deps.build_gemini_generate_content_config(), base_url=base, api_key=key)
         return Prepared(plan, payload, headers, base, deps.build_gemini_generate_content_deps(), gemini_config=config)
     if protocol == 'chat':
-        config = policy.get('runtime', {}).get('output_tool')
+        runtime = policy.get('runtime', {})
+        kunlun_config = runtime.get('kunlun_linux')
+        config = kunlun_config or runtime.get('output_tool')
         identity_payload = copy.deepcopy(payload) if config else None
-        output_tool = prepare_output_tool(payload, config, log=deps.log,
-                                         trace_prefix=f'[TRACE {trace_id}] ') if config else None
+        if kunlun_config is not None:
+            output_tool = prepare_kunlun_linux(payload, kunlun_config, log=deps.log,
+                                               trace_prefix=f'[TRACE {trace_id}] ')
+        else:
+            output_tool = prepare_output_tool(payload, config, log=deps.log,
+                                              trace_prefix=f'[TRACE {trace_id}] ') if config else None
         identity_plan = None
         if config is not None:
             # This changes the delivery envelope, not the visible request.
             # Preserve exact-request locks/cache keys across rollout and toggles.
             identity_plan = copy.deepcopy(plan)
             identity_plan['policy']['runtime'].pop('output_tool', None)
+            identity_plan['policy']['runtime'].pop('kunlun_linux', None)
         return Prepared(plan, payload, headers, base + '/v1/chat/completions',
                         deps.build_chat_completions_upstream_deps(), output_tool=output_tool,
                         identity_payload=identity_payload,

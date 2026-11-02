@@ -105,6 +105,15 @@ def matches_name(name, config):
 def record_marker(config):
     if config is None:
         return ''
+    if config.get('kind') == 'kunlun_linux':
+        value = {
+            'kind': 'kunlun_linux',
+            'name': config['tool']['function']['name'],
+            'field': config['field'],
+            'tool_prefix': config.get('tool_prefix', ''),
+            'client_tool_names': config.get('client_tool_names', []),
+        }
+        return RECORD_PREFIX + json.dumps(value, separators=(',', ':')) + ']\n'
     return RECORD_PREFIX + json.dumps({'name': config['tool']['function']['name'], 'field': config['field']}, separators=(',', ':')) + ']\n'
 
 
@@ -112,6 +121,22 @@ def record_settings(markers):
     for marker in markers:
         if marker.startswith(RECORD_PREFIX) and marker.endswith(']'):
             value = json.loads(marker[len(RECORD_PREFIX):-1])
+            if value.get('kind') == 'kunlun_linux':
+                if (set(value) != {'kind', 'name', 'field', 'tool_prefix', 'client_tool_names'}
+                        or not all(isinstance(value.get(k), str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', value[k])
+                                   for k in ('name', 'field'))
+                        or not isinstance(value['tool_prefix'], str)
+                        or not isinstance(value['client_tool_names'], list)
+                        or len(value['client_tool_names']) > 128
+                        or not all(isinstance(x, str) and len(x) <= 256 for x in value['client_tool_names'])):
+                    continue
+                return {
+                    'kind': 'kunlun_linux',
+                    'tool': {'function': {'name': value['name']}},
+                    'field': value['field'],
+                    'tool_prefix': value['tool_prefix'],
+                    'client_tool_names': value['client_tool_names'],
+                }
             if set(value) == {'name', 'field'} and all(isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', v) for v in value.values()):
                 return {'tool': {'function': {'name': value['name']}}, 'field': value['field']}
     return None
@@ -120,6 +145,9 @@ def record_settings(markers):
 def unwrap_completion(data, config):
     if config is None or not isinstance(data, dict):
         return data
+    if config.get('kind') == 'kunlun_linux':
+        from aetherstream.features.kunlun_linux import unwrap_completion as unwrap_kunlun_completion
+        return unwrap_kunlun_completion(data, config)
     result = copy.deepcopy(data)
     choices = result.get('choices')
     if not isinstance(choices, list):
@@ -284,8 +312,14 @@ class OutputToolStreamDecoder:
     def __init__(self, config):
         self.config = config
         self.states = {}
+        self.delegate = None
+        if config.get('kind') == 'kunlun_linux':
+            from aetherstream.features.kunlun_linux import KunlunStreamDecoder
+            self.delegate = KunlunStreamDecoder(config)
 
     def feed(self, data):
+        if self.delegate is not None:
+            return self.delegate.feed(data)
         result = copy.deepcopy(data)
         choices = result.get('choices')
         if not isinstance(choices, list):

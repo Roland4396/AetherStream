@@ -190,6 +190,13 @@ def global_policy(lookup):
             validate_settings(output_tool)
         except (ValueError, TypeError, AttributeError) as exc:
             raise RegistryError('invalid output_tool configuration: ' + str(exc)) from exc
+    kunlun_linux = lookup('kunlun_linux')
+    if kunlun_linux is not None:
+        from aetherstream.features.kunlun_linux import validate_settings
+        try:
+            validate_settings(kunlun_linux)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RegistryError('invalid kunlun_linux configuration: ' + str(exc)) from exc
     value = {k: copy.deepcopy(lookup(k)) for k in ('early_stop','streaming','filters')
              if lookup(k) is not None}
     value['runtime'] = {k: copy.deepcopy(lookup(k)) for k in ('claude','injections')
@@ -223,10 +230,18 @@ def enrich_selection(lookup, selection):
     mode = request_mode.resolve(cfg, cid, upstream)
     policy.setdefault('streaming', {})['force_upstream'] = mode['mode']
     policy['streaming'].pop('nonstream_to_stream', None)
-    from aetherstream.features.output_tool import selected_settings
-    output_tool = selected_settings(lookup('output_tool'), upstream, selection['transport'])
-    if output_tool is not None:
-        policy.setdefault('runtime', {})['output_tool'] = output_tool
+    from aetherstream.features.kunlun_linux import selected_settings as selected_kunlun_linux
+    kunlun_linux = selected_kunlun_linux(lookup('kunlun_linux'), selection)
+    output_tool = None
+    if kunlun_linux is not None:
+        # Kunlun owns the delivery envelope for its exact target.  Do not stack
+        # the separately configured actual_content envelope on the same request.
+        policy.setdefault('runtime', {})['kunlun_linux'] = kunlun_linux
+    else:
+        from aetherstream.features.output_tool import selected_settings
+        output_tool = selected_settings(lookup('output_tool'), upstream, selection['transport'])
+        if output_tool is not None:
+            policy.setdefault('runtime', {})['output_tool'] = output_tool
     if policy.get('session', {}).get('model') == '$upstream':policy['session']['model'] = upstream
     policy['account_overrides'] = copy.deepcopy(cfg.get('account_overrides', {}))
     policy['_local_policy'] = True
@@ -237,6 +252,8 @@ def enrich_selection(lookup, selection):
     revision_input = {'config': cfg, 'globals': globals_}
     if output_tool is not None:
         revision_input['output_tool'] = output_tool
+    if kunlun_linux is not None:
+        revision_input['kunlun_linux'] = kunlun_linux
     revision = hashlib.sha256(json.dumps(revision_input, sort_keys=True,
                                          ensure_ascii=False,separators=(',', ':')).encode()).hexdigest()[:20]
     return {**selection, 'policy':policy, 'policy_revision':revision, 'request_mode':mode, '_local_dedupe':True,

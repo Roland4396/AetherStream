@@ -44,6 +44,15 @@
     }
   },
   "filters": {},
+  "kunlun_linux": {
+    "enabled": false,
+    "match": {
+      "channels": ["free"],
+      "public_models": ["free/gemini-3.8-flash-high"]
+    },
+    "transports": ["chat"],
+    "source_sha256": "10aeaf58444893cf3309de2bfddce820e72600b4cfa1a9f735185395e598cbff"
+  },
   "channel_policies": {
     "schema": 1,
     "defaults": {},
