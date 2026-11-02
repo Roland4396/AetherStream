@@ -47,11 +47,15 @@ _CORPUS = json.loads(Path(__file__).with_name("kunlun_linux_corpus.json").read_t
 
 
 def validate_settings(config):
-    allowed = {"enabled", "match", "transports", "source_sha256"}
+    allowed = {"enabled", "match", "transports", "source_sha256", "default_insert_count"}
     if not isinstance(config, dict) or set(config) - allowed:
         raise ValueError("Invalid kunlun_linux settings")
     if "enabled" in config and not isinstance(config["enabled"], bool):
         raise ValueError("kunlun_linux.enabled must be boolean")
+    if "default_insert_count" in config:
+        count = config["default_insert_count"]
+        if type(count) is not int or count < 0:
+            raise ValueError("kunlun_linux.default_insert_count must be a non-negative integer")
     match = config.get("match", {})
     if not isinstance(match, dict) or set(match) - {"channels", "public_models"}:
         raise ValueError("kunlun_linux match must use exact channels and public_models")
@@ -248,10 +252,12 @@ def _extract_config(text, state):
     if match:
         state["insert_count"] = int(match.group(1).strip())
         state["explicit_insert_count"] = True
+        state["insert_count_source"] = "request"
     match = re.search(r"(?:^|\r?\n|[;\s,，#/])(?:插入数量|插入篇数|篇数|场景数量|篇章数量|手稿数量|insert_count|max_insert_count|scene_count|count)\s*[:：=]\s*[\"']?(\d+)[\"']?", text, re.I)
     if match:
         state["insert_count"] = int(match.group(1).strip())
         state["explicit_insert_count"] = True
+        state["insert_count_source"] = "request"
     match = re.search(r"(?:^|\r?\n|[;\s,，#/])(?:target_length|word_count|length|字数|篇幅)\s*[:：=]\s*[\"']?(\d+)[\"']?", text, re.I)
     if match:
         state["target_length"] = match.group(1).strip()
@@ -349,7 +355,10 @@ def prepare_kunlun_linux(payload, config, *, log, trace_prefix="", rng=None):
     tool_name = _tool_name(existing_names)
     state = {
         "role_p": "艾玛", "role_c": "特朗普", "active_roles": ["艾玛", "特朗普"],
-        "insert_count": 0, "explicit_insert_count": False, "target_length": "1500",
+        "insert_count": config.get("default_insert_count", 0),
+        "explicit_insert_count": "default_insert_count" in config,
+        "insert_count_source": "stream_default" if "default_insert_count" in config else "none",
+        "target_length": "1500",
         "perspective": "第三人称受限视角", "macros": {},
         "active_author": "陆清都 (东方古典修仙 · 苍茫道骨)",
     }
@@ -409,6 +418,11 @@ def prepare_kunlun_linux(payload, config, *, log, trace_prefix="", rng=None):
             return
         injected = True
         if not state["explicit_insert_count"] or state["insert_count"] <= 0 or historical_users < 2:
+            reason = ("no_config" if not state["explicit_insert_count"] else
+                      "disabled" if state["insert_count"] <= 0 else "insufficient_history")
+            log(f"{trace_prefix}kunlun_linux scene_insert source={state['insert_count_source']} "
+                f"requested={state['insert_count']} historical_users={historical_users} "
+                f"inserted=0 reason={reason}")
             scene_counter += 1
             return
         corpus = list(_CORPUS)
@@ -420,6 +434,9 @@ def prepare_kunlun_linux(payload, config, *, log, trace_prefix="", rng=None):
         for article, role_p, role_c in _distribute_articles(selected, _build_character_pairs(state["active_roles"])):
             scene_counter += 1
             context.append(_build_otherworld_scene(scene_counter, role_p, role_c, article))
+        log(f"{trace_prefix}kunlun_linux scene_insert source={state['insert_count_source']} "
+            f"requested={state['insert_count']} historical_users={historical_users} "
+            f"inserted={len(selected)} reason=applied")
         scene_counter += 1
 
     guide_pattern = re.compile(r"【ToolCall引导】[\s\S]*?(?=(?:【ToolCall引导】|$))", re.I)

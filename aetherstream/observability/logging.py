@@ -106,6 +106,7 @@ class ProxyLogger:
             "early_stop_upstream_close ",
             "normal_completion_guard ",
             "gemini_anti_route ",
+            "kunlun_linux ",
         )
         if any(token in lower for token in high_signal_tokens):
             return True

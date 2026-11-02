@@ -11,6 +11,7 @@ from aetherstream.features.kunlun_linux import (
     prepare_kunlun_linux,
     selected_settings,
     unwrap_completion,
+    validate_settings,
 )
 from aetherstream.features.output_tool import OutputToolStreamDecoder, record_marker, record_settings
 from aetherstream.routing.policy_config import enrich_selection
@@ -36,15 +37,79 @@ class ZeroShuffle:
             values[index], values[0] = values[0], values[index]
 
 
-def prepared(payload, *, rng=None):
+def prepared(payload, *, rng=None, config=None):
     logs = []
     body = copy.deepcopy(payload)
     with patch("aetherstream.features.kunlun_linux.secrets.token_hex", return_value="0001020304050607"):
-        response = prepare_kunlun_linux(body, CONFIG, log=logs.append, rng=rng)
+        response = prepare_kunlun_linux(body, CONFIG if config is None else config, log=logs.append, rng=rng)
     return body, response, logs
 
 
 class KunlunLinuxTests(unittest.TestCase):
+    @staticmethod
+    def _history():
+        return {"model": "free/gemini-3.8-flash-high", "messages": [
+            {"role": "user", "content": "第一轮"},
+            {"role": "assistant", "content": "第一轮回答"},
+            {"role": "user", "content": "第二轮"},
+            {"role": "assistant", "content": "第二轮回答"},
+            {"role": "user", "content": "当前输入"},
+        ]}
+
+    def test_configured_preset_default_inserts_three_without_tavern_parameter(self):
+        payload = self._history()
+        before = copy.deepcopy(payload)
+        body, _, logs = prepared(payload, config={**CONFIG, "default_insert_count": 3}, rng=ZeroShuffle())
+        desc = body["tools"][-1]["function"]["description"]
+        self.assertEqual(desc.count("〔时空界标：大千微尘折跃 · 现实停驻一瞬〕"), 3)
+        self.assertEqual(payload, before)
+        self.assertTrue(any("source=stream_default requested=3 historical_users=2 inserted=3 reason=applied" in line for line in logs))
+        self.assertFalse(any("当前输入" in line for line in logs))
+
+    def test_missing_default_preserves_existing_no_insertion_behavior(self):
+        body, _, logs = prepared(self._history(), rng=ZeroShuffle())
+        self.assertNotIn("〔时空界标：", body["tools"][-1]["function"]["description"])
+        self.assertTrue(any("inserted=0 reason=no_config" in line for line in logs))
+
+    def test_preset_default_preserves_first_two_turns_gate(self):
+        payload = self._history()
+        payload["messages"] = payload["messages"][:3]
+        body, _, logs = prepared(payload, config={**CONFIG, "default_insert_count": 3}, rng=ZeroShuffle())
+        self.assertNotIn("〔时空界标：", body["tools"][-1]["function"]["description"])
+        self.assertTrue(any("historical_users=1 inserted=0 reason=insufficient_history" in line for line in logs))
+
+    def test_explicit_request_count_overrides_stream_default_including_zero(self):
+        for count in (0, 1, 4):
+            with self.subTest(count=count):
+                payload = self._history()
+                payload["messages"].insert(0, {"role": "system", "content": f"【资料配置】\n插入数量 = {count}"})
+                actual, _, logs = prepared(payload, config={**CONFIG, "default_insert_count": 3}, rng=ZeroShuffle())
+                original, _, _ = prepared(payload, rng=ZeroShuffle())
+                self.assertEqual(actual, original)
+                self.assertEqual(actual["tools"][-1]["function"]["description"].count("〔时空界标："), count)
+                self.assertTrue(any(f"source=request requested={count}" in line for line in logs))
+
+    def test_invalid_defaults_are_rejected_without_coercion(self):
+        for count in (None, True, -1, "3", 3.5):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                validate_settings({**CONFIG, "default_insert_count": count})
+
+    def test_default_count_changes_cache_identity_but_random_tool_names_do_not(self):
+        data = self._history()
+        deps = SimpleNamespace(log=lambda _message: None, build_chat_completions_upstream_deps=lambda: object())
+        def make(config):
+            plan = {"transport": "chat", "base_url": "http://mock.invalid/v1", "api_key": "mock",
+                    "policy": {"runtime": {"kunlun_linux": config}}}
+            return prepare_adapter(data, plan, deps, trace_id="test", upstream_stream=False)
+        no_default = make(CONFIG)
+        first = make({**CONFIG, "default_insert_count": 3})
+        second = make({**CONFIG, "default_insert_count": 3})
+        self.assertNotEqual(first.output_tool["tool"]["function"]["name"], second.output_tool["tool"]["function"]["name"])
+        self.assertEqual(first.identity_plan, second.identity_plan)
+        self.assertEqual(first.identity_payload, second.identity_payload)
+        self.assertNotEqual(first.identity_plan, no_default.identity_plan)
+        self.assertEqual(first.identity_plan["policy"]["runtime"]["kunlun_linux"], {"default_insert_count": 3})
+
     def test_policy_selects_kunlun_instead_of_stacking_existing_output_tool(self):
         output_tool = {
             "enabled": True,
@@ -130,8 +195,7 @@ class KunlunLinuxTests(unittest.TestCase):
         self.assertTrue(all(name in item["content"] for item in body["messages"]))
         self.assertEqual(response["kind"], "kunlun_linux")
         self.assertEqual(response["client_tool_names"], ["weather"])
-        self.assertEqual(len(logs), 1)
-        self.assertIn("kunlun_linux injected", logs[0])
+        self.assertTrue(any("kunlun_linux injected" in line for line in logs))
 
     def test_two_historical_users_activate_exact_count_and_runtime_scene_text(self):
         payload = {

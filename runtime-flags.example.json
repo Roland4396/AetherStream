@@ -46,6 +46,7 @@
   "filters": {},
   "kunlun_linux": {
     "enabled": false,
+    "default_insert_count": 3,
     "match": {
       "channels": ["free"],
       "public_models": ["free/gemini-3.8-flash-high"]

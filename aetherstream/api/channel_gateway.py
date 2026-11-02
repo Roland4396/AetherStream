@@ -199,6 +199,14 @@ def prepare_adapter(data: dict, plan: dict, deps, *, trace_id: str, upstream_str
             identity_plan = copy.deepcopy(plan)
             identity_plan['policy']['runtime'].pop('output_tool', None)
             identity_plan['policy']['runtime'].pop('kunlun_linux', None)
+            if (kunlun_config is not None and output_tool is not None
+                    and 'default_insert_count' in kunlun_config):
+                # Preset scene defaults alter context, unlike the output-only
+                # envelope. Never return a cached no-insertion reply after
+                # enabling them; random wire tool names still stay out of keys.
+                identity_plan['policy']['runtime']['kunlun_linux'] = {
+                    'default_insert_count': kunlun_config['default_insert_count'],
+                }
         return Prepared(plan, payload, headers, base + '/v1/chat/completions',
                         deps.build_chat_completions_upstream_deps(), output_tool=output_tool,
                         identity_payload=identity_payload,
