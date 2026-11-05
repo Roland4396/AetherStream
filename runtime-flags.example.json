@@ -1,6 +1,10 @@
 {
   "quota_keeper": {
-    "enabled": false
+    "enabled": false,
+    "argon_weekly": {
+      "enabled": false,
+      "model": "gemini-4-argon-low"
+    }
   },
   "account_routing": {
     "enabled": false,

@@ -398,3 +398,10 @@ OpenRouter fallback 字段会设为 false，不凭空加入路由字段。
 ## 配置驱动的输出工具封装
 
 为指定模型复用已有工具定义，将工具参数透明还原为正文；保持原有请求方式、早停与回放。详见 [输出工具封装](docs/output-tool-envelope.md)。
+
+### Optional Argon weekly cycle
+
+Argon has a separately opt-in weekly schedule under `quota_keeper.argon_weekly`.
+It reads only the independent Argon bucket, preserves the Claude policy above,
+and uses one tiny exact-account GProxy request only for an unused cycle.
+See [configuration, durable guards and recovery](docs/argon-weekly-keeper.md).

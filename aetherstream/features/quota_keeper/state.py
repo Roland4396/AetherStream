@@ -42,6 +42,17 @@ class StateStore:
             for key, row in state['accounts'].items():
                 if not isinstance(key, str) or not isinstance(row, dict):
                     raise ValueError('Invalid account row')
+                weekly = row.get('argon_weekly', {})
+                if not isinstance(weekly, dict):
+                    raise ValueError('Invalid Argon state')
+                for field in ('next_at', 'guard_until', 'last_trigger_at', 'cycle_end', 'last_probe_at'):
+                    if field in weekly and (isinstance(weekly[field], bool) or
+                            not isinstance(weekly[field], (int, float)) or
+                            not math.isfinite(weekly[field]) or weekly[field] < 0):
+                        raise ValueError('Invalid Argon deadline')
+                for field in ('paused', 'pending_verify', 'uncertain_attempt', 'cycle_confirmed'):
+                    if field in weekly and not isinstance(weekly[field], bool):
+                        raise ValueError('Invalid Argon guard')
                 for field in ('next_at', 'guard_until', 'last_trigger_at'):
                     if field in row and (isinstance(row[field], bool) or
                             not isinstance(row[field], (int, float)) or

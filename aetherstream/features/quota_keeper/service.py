@@ -12,6 +12,7 @@ from aetherstream.utils.coerce import coerce_bool
 from .client import GproxyClient, MODEL, ProbeError
 from .policy import FIVE_HOURS, GRACE, RETRY_DELAYS, account_groups, decision, observed, windows
 from .state import StateError, StateStore
+from . import argon
 
 
 async def handle_account(api, members, row, persist, emit, *, clock=time.time, may_generate=lambda: True):
@@ -142,6 +143,13 @@ class QuotaKeeper:
         # Configuration cannot turn this feature into a request flood.
         return min(3600, max(60, value))
 
+    def argon_settings(self):
+        try:
+            return argon.settings(self.lookup('quota_keeper', 'argon_weekly'))
+        except (ValueError, TypeError):
+            return {'enabled': False, 'model': 'gemini-4-argon-low',
+                    'configuration_error': 'invalid_settings'}
+
     def emit(self, event: str, **fields):
         # Do not pass exception messages, credentials, arbitrary reply text or URLs.
         fields.pop('reply', None)
@@ -224,6 +232,17 @@ class QuotaKeeper:
                                 )
                             except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
                                 quota_failure(row, self.clock(), exc, persist, self.emit)
+                            argon_config = self.argon_settings()
+                            if argon_config['enabled'] and self.enabled() and not self._stop.is_set():
+                                weekly = row.setdefault('argon_weekly', {})
+                                try:
+                                    await argon.handle_argon_account(
+                                        api, members, weekly, persist, self.emit,
+                                        model=argon_config['model'], clock=self.clock,
+                                        may_generate=lambda: (self.enabled() and not self._stop.is_set()
+                                                              and self.argon_settings() == argon_config))
+                                except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
+                                    argon.quota_failure(weekly, self.clock(), exc, persist, self.emit)
                     state['last_run_at'] = self.clock()
                     state['schema_version'] = 1
                     persist()
@@ -264,6 +283,7 @@ class QuotaKeeper:
                 'attempts': row.get('triggers', 0),
                 'quota_failures': row.get('failures', 0),
                 'windows': row.get('windows', {}),
+                'argon_weekly': argon.status(row.get('argon_weekly', {})),
                 'last_generation': {key: generation[key] for key in
                     ('http_status', 'ok', 'usage') if key in generation},
             })
@@ -272,6 +292,7 @@ class QuotaKeeper:
             'status': 'disabled' if not enabled else ('degraded' if error else
                       'standby' if self._lock_busy else 'running'),
             'model': MODEL,
+            'argon_weekly': self.argon_settings(),
             'check_interval_sec': self.interval(),
             'worker_running': self._task is not None and not self._task.done(),
             'in_sweep': self._in_sweep,
@@ -297,5 +318,25 @@ class QuotaKeeper:
                                    status='resume_scheduled')
                         self.store.save(state)
                         self.emit('resume_scheduled', credential_id=credential_id)
+                        return 'scheduled'
+                return 'not_found'
+
+
+    async def resume_argon(self, credential_id):
+        """Recheck only: an uncertain paid attempt is never erased by resume."""
+        if self._mutation_lock.locked():
+            return 'busy'
+        async with self._mutation_lock:
+            with self.store.locked() as acquired:
+                if not acquired:
+                    return 'busy'
+                state = self.store.load()
+                for row in state['accounts'].values():
+                    if credential_id in row.get('credential_ids', []):
+                        weekly = row.setdefault('argon_weekly', {})
+                        weekly.update(paused=False, failures=0, next_at=0,
+                                      status='resume_scheduled')
+                        self.store.save(state)
+                        self.emit('argon_resume_scheduled', credential_id=credential_id)
                         return 'scheduled'
                 return 'not_found'
