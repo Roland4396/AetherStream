@@ -6,12 +6,10 @@ import math
 from datetime import datetime
 from pathlib import Path
 import time
-import uuid
 
 import httpx
 
-MODEL = 'claude-opus-4-6-thinking'
-GENERATION_URL = 'https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent'
+MODEL = 'claude-opus-5-5-low'
 
 
 class ProbeError(Exception):
@@ -66,124 +64,115 @@ class GproxyClient:
     async def cached(self, credential_id: int):
         return await self.api(f'credentials/{credential_id}/quota')
 
-    async def probe(self, credential_id: int):
-        start = time.time()
-        result = await self.api(f'credentials/{credential_id}/quota-probe?force=true', {})
-        snapshot = result.get('snapshot', {})
-        source = next((s for s in snapshot.get('sources', [])
-                       if s.get('capability', {}).get('id') == 'subscription'), {})
-        if not result.get('raw') or source.get('error') or (
-                source.get('observed_at_ms') or 0) < int(start * 1000) - 2000:
-            raise ProbeError('No fresh successful subscription quota')
-        return snapshot
+    async def probe(self, credential_id):
+        """Fresh native Claude quota + catalogue, never the legacy generation path."""
+        observed, models, buckets = await self.diagnostic(credential_id)
+        entries = []
+        for name in ('3p-5h', '3p-weekly'):
+            found = [b for b in buckets if b.get('bucketId') == name]
+            if len(found) != 1:
+                raise ProbeError('Missing or ambiguous Claude quota')
+            value = bucket_reading(found[0])
+            duration = 18000 if name == '3p-5h' else 604800
+            if value['end'] > observed / 1000 + duration + 300:
+                raise ProbeError('Invalid Claude quota duration')
+            entries.append({'id': name, 'source_id': 'subscription',
+                'label': 'antigravity_disabled' if found[0].get('disabled') is True else None,
+                'value': {'kind': 'window', 'used_percent': (1 - value['remaining']) * 100,
+                          'period_end': value['end']}})
+        return {'sources': [{'capability': {'id': 'subscription'},
+                             'observed_at_ms': observed, 'error': None}],
+                'entries': entries, 'available_models': sorted(models)}
 
-    async def generate(self, credential_id: int):
-        secret = (await self.api(f'credentials/{credential_id}/reveal', {}))['secret']
-        if isinstance(secret, str):
-            secret = json.loads(secret)
-        body = {'model': MODEL, 'project': secret['project_id'],
-                'user_prompt_id': uuid.uuid4().hex,
-                'request': {'model': MODEL,
-                    'contents': [{'role': 'user', 'parts': [{'text': 'Reply with OK only.'}]}],
-                    'generationConfig': {'maxOutputTokens': 64,
-                        'thinkingConfig': {'includeThoughts': False, 'thinkingBudget': 0}}}}
-        # Never use the chat router, another account, another model, or retries.
-        async with httpx.AsyncClient(trust_env=False, follow_redirects=False,
-                                     timeout=httpx.Timeout(90, connect=10)) as session:
-            response = await session.post(GENERATION_URL, json=body, headers={
-                'Authorization': 'Bearer ' + secret['access_token'],
-                'Content-Type': 'application/json', 'Accept': 'application/json',
-                'User-Agent': 'antigravity/cli/1.0.6 linux/amd64',
-            })
-        secret = None
-        result = {'http_status': response.status_code, 'ok': False}
-        if not response.is_success:
-            return result
-        raw = response.json()
-        data = raw.get('response', raw)
-        reply = ''.join(part.get('text', '') for candidate in data.get('candidates', [])
-                        for part in candidate.get('content', {}).get('parts', [])
-                        if not part.get('thought'))
-        # Store metrics only, never credentials, headers or arbitrary response text.
-        usage = data.get('usageMetadata') or {}
-        result.update(ok=bool(reply.strip()), response_model=data.get('modelVersion'),
-                      usage={key: usage[key] for key in (
-                          'promptTokenCount', 'candidatesTokenCount', 'totalTokenCount')
-                          if isinstance(usage.get(key), (int, float))})
-        return result
+    async def generate(self, credential_id, *, provider_id, model=MODEL):
+        # Native GProxy transport retains account/session identity. Exact
+        # provider + credential, ping and maxOutputTokens=16, one core attempt.
+        # This never reveals a secret, calls Google directly or uses Stream transforms.
+        from .claude import model_name
+        model_name(model)
+        return await self.model_test(provider_id, credential_id, model)
 
+    async def model_test(self, provider_id, credential_id, model):
+        raw = await self.api('models/test', {
+            'providerId': native_id('providers', provider_id),
+            'credentialId': native_id('credentials', credential_id), 'model': model})
+        if not isinstance(raw, dict):
+            raise ProbeError('Invalid generation response')
+        from .argon import safe_result
+        # raw.model is merely the requested-name echo, NOT response identity.
+        return safe_result({'http_status': raw.get('status', 0),
+            'ok': raw.get('ok') is True and not raw.get('error'), 'usage': raw.get('usage')})
 
-    async def argon_probe(self, credential_id):
-        """Native diagnostic preserves Argon's independent bucket (legacy quota drops it)."""
+    async def diagnostic(self, credential_id):
+        """Fresh, lean native evidence; never retain raw experiments or account labels."""
         started = time.time()
         result = await self.api('credentials/' + native_id('credentials', credential_id)
                                 + '/quota-diagnostics', {})
         if not isinstance(result, dict) or not isinstance(result.get('snapshot'), dict):
-            raise ProbeError('Invalid Argon diagnostic envelope')
+            raise ProbeError('Invalid quota diagnostic envelope')
         observed = result['snapshot'].get('observedAtMs')
         if (result.get('error') or isinstance(observed, bool)
                 or not isinstance(observed, (int, float)) or not math.isfinite(observed)
                 or observed < int(started * 1000) - 2000
                 or observed > int(time.time() * 1000) + 2000):
-            raise ProbeError('No fresh successful Argon diagnostic')
-        models, buckets, catalogue = [], [], False
+            raise ProbeError('No fresh successful quota diagnostic')
         responses = result.get('responses')
         if not isinstance(responses, list):
-            raise ProbeError('Invalid Argon diagnostic responses')
+            raise ProbeError('Invalid quota diagnostic responses')
+        models, buckets, catalogue = set(), [], False
         for response in responses:
-            if not isinstance(response, dict):
-                raise ProbeError('Invalid Argon diagnostic response')
+            if not isinstance(response, dict) or response.get('status') != 200:
+                raise ProbeError('Failed quota diagnostic response')
             body = response.get('body')
-            if response.get('status') != 200 or not isinstance(body, dict):
-                continue
+            if not isinstance(body, dict):
+                raise ProbeError('Invalid quota diagnostic body')
             if isinstance(body.get('models'), dict):
                 catalogue = True
-                models.extend(name for name, data in body['models'].items()
-                              if name in ARGON_MODELS and isinstance(data, dict)
-                              and data.get('disabled') is not True)
-            for group in body.get('groups', []) if isinstance(body.get('groups'), list) else []:
+                models.update(name for name, value in body['models'].items()
+                              if isinstance(value, dict) and value.get('disabled') is not True)
+            groups = body.get('groups', [])
+            if not isinstance(groups, list):
+                raise ProbeError('Invalid quota diagnostic groups')
+            for group in groups:
                 items = group.get('buckets', []) if isinstance(group, dict) else []
                 if not isinstance(items, list):
-                    raise ProbeError('Invalid Argon diagnostic buckets')
-                for bucket in items:
-                    if isinstance(bucket, dict) and bucket.get('bucketId') == ARGON_BUCKET:
-                        buckets.append(bucket)
+                    raise ProbeError('Invalid quota diagnostic buckets')
+                buckets.extend(b for b in items if isinstance(b, dict))
         if not catalogue:
-            raise ProbeError('No Argon catalogue evidence')
+            raise ProbeError('No catalogue evidence')
+        return observed, models, buckets
+
+    async def argon_probe(self, credential_id):
+        observed, models, buckets = await self.diagnostic(credential_id)
+        models = sorted(models & ARGON_MODELS)
         if not models:
             return {'available': False, 'models': [], 'observed_at_ms': observed}
-        if len(buckets) != 1:
+        found = [b for b in buckets if b.get('bucketId') == ARGON_BUCKET]
+        if len(found) != 1:
             raise ProbeError('Missing or ambiguous independent Argon weekly bucket')
-        bucket = buckets[0]
-        if bucket.get('disabled') is True:
+        if found[0].get('disabled') is True:
             return {'available': False, 'models': models, 'observed_at_ms': observed}
-        raw = bucket.get('remainingFraction')
-        try:
-            if isinstance(raw, bool):
-                raise ValueError('boolean quota')
-            remaining = float(raw)
-            reset = datetime.fromisoformat(str(bucket['resetTime']).replace('Z', '+00:00'))
-            if reset.tzinfo is None or not math.isfinite(remaining) or not 0 <= remaining <= 1:
-                raise ValueError('invalid quota')
-            end = reset.timestamp()
-        except (ValueError, TypeError, KeyError, OverflowError):
-            raise ProbeError('Invalid Argon weekly reading') from None
-        return {'available': True, 'models': sorted(set(models)), 'remaining': remaining,
-                'end': end, 'observed_at_ms': observed}
+        return {'available': True, 'models': models, 'observed_at_ms': observed,
+                **bucket_reading(found[0])}
 
     async def generate_argon(self, member, model):
         if model not in ARGON_MODELS:
             raise ValueError('Unsupported Argon keepalive model')
-        # Existing GProxy admin generation: exact provider + credential, one
-        # attempt, no failover, ping input and native maxOutputTokens=16.
-        # It uses GProxy's account/session/TLS identity, not the legacy direct
-        # Google client, and bypasses Stream's ACT/Kunlun story transforms.
-        raw = await self.api('models/test', {
-            'providerId': native_id('providers', member['provider_id']),
-            'credentialId': native_id('credentials', member['id']), 'model': model})
-        from .argon import safe_result
-        return safe_result({'http_status': raw.get('status', 0),
-                            'ok': raw.get('ok') is True, 'usage': raw.get('usage')})
+        return await self.model_test(member['provider_id'], member['id'], model)
+
+
+def bucket_reading(bucket):
+    try:
+        raw = bucket.get('remainingFraction')
+        if isinstance(raw, bool):
+            raise ValueError('boolean quota')
+        remaining = float(raw)
+        reset = datetime.fromisoformat(str(bucket['resetTime']).replace('Z', '+00:00'))
+        if reset.tzinfo is None or not math.isfinite(remaining) or not 0 <= remaining <= 1:
+            raise ValueError('invalid quota')
+        return {'remaining': remaining, 'end': reset.timestamp()}
+    except (ValueError, TypeError, KeyError, OverflowError):
+        raise ProbeError('Invalid quota bucket') from None
 
 
 ARGON_BUCKET = 'gemini-argon-wtu-weekly'

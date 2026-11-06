@@ -6,7 +6,7 @@ import math
 import httpx
 
 from .client import ProbeError
-from .policy import GRACE, RETRY_DELAYS
+from .policy import GRACE, RETRY_DELAYS, reset_clock_running
 
 WEEK = 7 * 24 * 3600
 UNAVAILABLE_RECHECK = 24 * 3600
@@ -35,11 +35,15 @@ def safe_result(value):
     if isinstance(status, bool) or not isinstance(status, int):
         status = 0
     usage = value.get('usage') or {}
-    return {'http_status': status, 'ok': value.get('ok') is True,
-            'usage': {k: v for k, v in usage.items()
-                      if k in ('inputTokens', 'outputTokens', 'reasoningTokens')
-                      and not isinstance(v, bool) and isinstance(v, (int, float))
-                      and math.isfinite(v) and v >= 0} if isinstance(usage, dict) else {}}
+    usage = {k: v for k, v in usage.items()
+             if k in ('inputTokens', 'outputTokens', 'reasoningTokens')
+             and not isinstance(v, bool) and isinstance(v, (int, float))
+             and math.isfinite(v) and v >= 0} if isinstance(usage, dict) else {}
+    transport_ok = value.get('transport_ok', value.get('ok')) is True and 200 <= status < 300
+    evidence = usage.get('outputTokens', 0) > 0 or usage.get('reasoningTokens', 0) > 0
+    return {'http_status': status, 'ok': transport_ok and evidence,
+            'transport_ok': transport_ok, 'generation_evidence': bool(transport_ok and evidence), 'usage': usage}
+
 
 
 async def handle_argon_account(api, members, row, persist, emit, *, model,
@@ -54,6 +58,8 @@ async def handle_argon_account(api, members, row, persist, emit, *, model,
     row['credential_id'] = cid
     reading = await api.argon_probe(cid)
     now = clock()
+    previous_window = row.get('window') or {}
+    previous_observed = row.get('observed_at_ms', 0) / 1000
     row.update(last_probe_at=now, observed_at_ms=reading['observed_at_ms'],
                available=reading['available'], window={k: reading[k] for k in
                    ('remaining', 'end') if k in reading})
@@ -73,17 +79,30 @@ async def handle_argon_account(api, members, row, persist, emit, *, model,
             or isinstance(end, bool) or not isinstance(end, (int, float))
             or not math.isfinite(end) or end + GRACE <= now or end > now + WEEK + 300):
         raise ProbeError('Invalid or stale Argon weekly window')
-    if remaining < 1:
-        # Any existing real use starts this cycle. Exhaustion also waits for
-        # the weekly reset; neither condition warrants another completion.
-        checked = unconfirmed
-        row.update(status='waiting', next_at=end + GRACE, cycle_end=end,
-                   cycle_confirmed=True, pending_verify=False,
+    running = reset_clock_running(end, reading['observed_at_ms'] / 1000, WEEK, now,
+                                  previous_end=previous_window.get('end'),
+                                  previous_observed=previous_observed)
+    possible_clock = end < reading['observed_at_ms'] / 1000 + WEEK - 15
+    if remaining < 1 or running or possible_clock:
+        # A depleted/full balance cannot override a genuine fixed reset clock.
+        # Usage suppresses spending; only the reset clock confirms the cycle.
+        if unconfirmed and not running:
+            checks = row.get('clock_checks', 0) + 1
+            row.update(clock_checks=checks, cycle_confirmed=False, uncertain_attempt=True,
+                       pending_verify=checks < 2, paused=checks >= 2, failures=0,
+                       next_at=now + VERIFY_DELAY,
+                       status='awaiting_cycle_clock' if checks < 2 else 'paused_unconfirmed_generation')
+            persist()
+            return
+        row.update(status='waiting' if running or remaining < 1 else 'awaiting_cycle_clock',
+                   next_at=end + GRACE if running or remaining < 1 else now + VERIFY_DELAY, cycle_end=end,
+                   cycle_confirmed=running, pending_verify=False, clock_checks=0,
                    uncertain_attempt=False, failures=0)
         persist()
-        if checked:
+        if unconfirmed:
             emit('argon_cycle_checked', credential_id=cid, confirmed=True, next_at=end + GRACE)
         return
+
     if unconfirmed:
         # A sliding unused deadline is NOT proof that a submitted request
         # failed to arrive. This ambiguity survives a week, restart and resume.
@@ -100,13 +119,13 @@ async def handle_argon_account(api, members, row, persist, emit, *, model,
         persist()
         return
     row.update(last_trigger_at=now, guard_until=now + WEEK + GRACE,
-               pending_verify=True, uncertain_attempt=True, cycle_confirmed=False,
+               pending_verify=True, uncertain_attempt=True, cycle_confirmed=False, clock_checks=0,
                next_at=now + VERIFY_DELAY, status='submitted', model=model,
                triggers=row.get('triggers', 0) + 1, failures=0)
     persist()  # Durable BEFORE the one paid POST; singleton lease stays held.
     try:
         result = safe_result(await api.generate_argon(member, model))
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
+    except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
         row.update(status='delivery_uncertain', generation_error=type(exc).__name__)
         persist()
         emit('argon_delivery_uncertain', credential_id=cid, error_type=type(exc).__name__)

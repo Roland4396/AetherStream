@@ -9,7 +9,7 @@ import httpx
 from fastapi import FastAPI
 
 from aetherstream.api.quota_keeper_routes import register_routes
-from aetherstream.features.quota_keeper.client import GproxyClient, GENERATION_URL, MODEL, ProbeError
+from aetherstream.features.quota_keeper.client import GproxyClient, MODEL, ProbeError
 from aetherstream.features.quota_keeper.policy import account_groups, decision, windows
 from aetherstream.features.quota_keeper.service import QuotaKeeper, handle_account, quota_failure
 from aetherstream.features.quota_keeper.state import StateError, StateStore
@@ -24,12 +24,22 @@ def snapshot(short_used=0, week_used=0, short_end=None, week_end=None, disabled=
         return {'id': name, 'source_id': 'subscription', 'label': label,
                 'value': {'kind': 'window', 'used_percent': None if used is None else str(used),
                           'period_end': deadline}}
-    return {'sources': [{'capability': {'id': 'subscription'},
+    return {'available_models': [MODEL], 'sources': [{'capability': {'id': 'subscription'},
                           'observed_at_ms': NOW * 1000, 'error': None}],
             'entries': [entry('3p-5h', short_used, NOW + 18000 if short_end is None else short_end,
                               'antigravity_disabled' if disabled else None),
                         entry('3p-weekly', week_used, NOW + 604800 if week_end is None else week_end),
                         entry('gemini-5h', 0, NOW - 500)]}
+
+
+def diagnostic():
+    from datetime import datetime, timezone
+    return {'error': None, 'snapshot': {'observedAtMs': NOW * 1000}, 'responses': [
+        {'status': 200, 'body': {'models': {MODEL: {'disabled': False}}}},
+        {'status': 200, 'body': {'groups': [{'buckets': [
+            {'bucketId': name, 'remainingFraction': 1,
+             'resetTime': datetime.fromtimestamp(NOW+duration, timezone.utc).isoformat()}
+            for name,duration in [('3p-5h',18000),('3p-weekly',604800)]]}]}}]}
 
 
 class FakeApi:
@@ -40,7 +50,7 @@ class FakeApi:
         self.probes = []
         self.generations = []
         self.api_calls = []
-        self.result = {'http_status': 200, 'ok': True, 'usage': {'totalTokenCount': 16}}
+        self.result = {'http_status': 200, 'ok': True, 'usage': {'inputTokens': 12, 'outputTokens': 4}}
 
     async def __aenter__(self):
         return self
@@ -60,7 +70,7 @@ class FakeApi:
         self.probes.append(cid)
         return self.fresh
 
-    async def generate(self, cid):
+    async def generate(self, cid, **kwargs):
         self.generations.append(cid)
         if isinstance(self.result, Exception):
             raise self.result
@@ -118,7 +128,7 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         row = {}
         persisted = []
         original = api.generate
-        async def generate(cid):
+        async def generate(cid, **kwargs):
             self.assertTrue(persisted[-1]['pending_verify'])
             self.assertEqual(persisted[-1]['triggers'], 1)
             self.assertEqual(persisted[-1]['guard_until'], NOW + 18030)
@@ -133,6 +143,7 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         row = {}
         await self.run_account(api, row)
         api.fresh = snapshot(short_used=0.0032)
+        api.fresh['sources'][0]['observed_at_ms'] = (NOW+61)*1000
         await self.run_account(api, row, NOW+61)
         self.assertEqual(api.generations, [13])
         self.assertTrue(row['cycle_confirmed'])
@@ -144,6 +155,7 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         row = {}
         await self.run_account(api, row)
         api.fresh = snapshot(short_used=0.0032)
+        api.fresh['sources'][0]['observed_at_ms'] = (NOW+61)*1000
         await self.run_account(api, row, NOW+61)
         self.assertTrue(row['cycle_confirmed'])
         self.assertEqual(api.generations, [13])
@@ -170,9 +182,10 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         api.result = {'http_status': 503, 'ok': False}
         row = {}
         await self.run_account(api, row)
-        await self.run_account(api, row, NOW+604800)
+        self.assertEqual(row['status'], 'response_unverified')
+        await self.run_account(api, row, NOW+61)
         self.assertEqual(api.generations, [13])
-        self.assertEqual(row['status'], 'paused_generation_error')
+        self.assertEqual(row['status'], 'paused_unconfirmed_generation')
 
     async def test_unknown_and_stale_quota_do_not_generate(self):
         for data in (snapshot(short_used=None), snapshot(short_end=NOW-100)):
@@ -214,7 +227,7 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_after_guard_preserves_indeterminate_request(self):
         api = FakeApi()
         entered = asyncio.Event()
-        async def generate(cid):
+        async def generate(cid, **kwargs):
             entered.set()
             await asyncio.Event().wait()
         api.generate = generate
@@ -309,7 +322,7 @@ class NativeFeatureTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_request_does_not_block_status_or_loop(self):
         started = asyncio.Event()
         release = asyncio.Event()
-        async def generate(cid):
+        async def generate(cid, **kwargs):
             started.set()
             await release.wait()
             return self.api.result
@@ -345,7 +358,7 @@ class NativeFeatureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shutdown_timeout_preserves_guard_and_releases_file_lock(self):
         started = asyncio.Event()
-        async def generate(cid):
+        async def generate(cid, **kwargs):
             started.set()
             await asyncio.Event().wait()
         self.api.generate = generate
@@ -409,9 +422,9 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                     if request.url.path.endswith('/login'):
                         return httpx.Response(200, json={'ok': True}, headers={'Set-Cookie': 'gproxy_session=fake; Path=/'})
                     self.assertIn('gproxy_session=fake', request.headers.get('cookie', ''))
-                    if request.url.path.endswith('/quota-probe'):
-                        self.assertEqual(request.url.query, b'force=true')
-                        return httpx.Response(200, json={'raw': ['synthetic-evidence'], 'snapshot': snapshot()})
+                    if request.url.path.endswith('/quota-diagnostics'):
+                        self.assertEqual(request.url.query, b'')
+                        return httpx.Response(200, json=diagnostic())
                     if request.url.path.endswith('/reveal'):
                         return httpx.Response(200, json={'secret': {'project_id': 'fake'}})
                     return httpx.Response(200, json=snapshot())
@@ -440,22 +453,14 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generation_fixed_model_no_fallback_or_secret_persistence(self):
         api = GproxyClient('http://test', 'unused')
-        api.api = AsyncMock(return_value={'secret': {'project_id': 'project', 'access_token': 'PRIVATE'}})
-        session = AsyncMock()
-        session.post.return_value = httpx.Response(200, json={'response': {
-            'modelVersion': MODEL, 'candidates': [{'content': {'parts': [{'text': 'OK'}]}}],
-            'usageMetadata': {'promptTokenCount': 12, 'candidatesTokenCount': 4, 'totalTokenCount': 16}}})
+        api.api = AsyncMock(return_value={'status': 200, 'ok': True, 'model': MODEL,
+            'reply': 'PRIVATE', 'credentialLabel': 'PRIVATE',
+            'usage': {'inputTokens': 12, 'outputTokens': 4}})
         with patch('aetherstream.features.quota_keeper.client.httpx.AsyncClient') as factory:
-            factory.return_value.__aenter__.return_value = session
-            result = await api.generate(13)
-        factory.assert_called_once()
-        self.assertFalse(factory.call_args.kwargs['follow_redirects'])
-        self.assertFalse(factory.call_args.kwargs['trust_env'])
-        session.post.assert_awaited_once()
-        args, kwargs = session.post.call_args
-        self.assertEqual(args[0], GENERATION_URL)
-        self.assertEqual(kwargs['json']['model'], MODEL)
-        self.assertEqual(kwargs['json']['request']['generationConfig']['maxOutputTokens'], 64)
+            result = await api.generate(13, provider_id=4)
+        factory.assert_not_called()
+        api.api.assert_awaited_once_with('models/test', {'providerId':'v3-providers-4',
+            'credentialId':'v3-credentials-13','model':MODEL})
         self.assertTrue(result['ok'])
         self.assertNotIn('PRIVATE', json.dumps(result))
         self.assertNotIn('reply', result)

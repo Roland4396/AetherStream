@@ -53,6 +53,8 @@ class StateStore:
                 for field in ('paused', 'pending_verify', 'uncertain_attempt', 'cycle_confirmed'):
                     if field in weekly and not isinstance(weekly[field], bool):
                         raise ValueError('Invalid Argon guard')
+                if 'uncertain_attempt' in row and not isinstance(row['uncertain_attempt'], bool):
+                    raise ValueError('Invalid Claude uncertainty guard')
                 for field in ('next_at', 'guard_until', 'last_trigger_at'):
                     if field in row and (isinstance(row[field], bool) or
                             not isinstance(row[field], (int, float)) or

@@ -1,7 +1,7 @@
 """Pure scheduling policy, preserved from the original systemd keeper.
 
-An unused quota API deadline slides with query time; a nonzero used window
-has a running clock. A future deadline alone is NOT evidence of a live cycle.
+An unused API deadline slides with query time. Fixed reset clocks establish
+a live cycle even with zero reported use; a future deadline alone does not.
 """
 
 import math
@@ -33,22 +33,64 @@ def windows(snapshot):
     }
 
 
-def decision(quota, now):
+def reset_clock_running(end, observed_at, duration, now, *, previous_end=None,
+                        previous_observed=None):
+    """A fixed countdown, not the sliding unused now+duration placeholder.
+
+    Compare against the snapshot's observation time, never current time alone:
+    an old unused cached snapshot must not look like a running clock as it ages.
+    """
+    values = (end, observed_at, duration, now)
+    if any(isinstance(v, bool) or not isinstance(v, (int, float))
+           or not math.isfinite(v) for v in values):
+        return False
+    if observed_at <= 0 or observed_at > now + 2 or end <= now:
+        return False
+    return (isinstance(previous_end, (int, float)) and not isinstance(previous_end, bool)
+            and isinstance(previous_observed, (int, float)) and not isinstance(previous_observed, bool)
+            and math.isfinite(previous_end) and math.isfinite(previous_observed)
+            and previous_observed > 0 and observed_at - previous_observed >= 15
+            and abs(end - previous_end) <= 2)
+
+
+def cycle_running(quota, kind, now, *, observed_at=0, previous=None,
+                  previous_observed=0):
+    window = quota.get(kind, {})
+    end = window.get('end')
+    if not isinstance(end, (int, float)) or end <= now or window.get('disabled'):
+        return False
+    # Usage may suppress a paid request, but only the clock confirms the cycle.
+    return reset_clock_running(end, observed_at,
+        FIVE_HOURS if kind == '3p-5h' else 7 * 24 * 3600, now,
+        previous_end=(previous or {}).get(kind, {}).get('end'),
+        previous_observed=previous_observed)
+
+
+def decision(quota, now, *, observed_at=0, previous=None, previous_observed=0):
     """Return wait(deadline), due, unused, or unknown; never invent a reset."""
     week, short = quota.get("3p-weekly"), quota.get("3p-5h")
-    if not week or week["used"] is None:
-        return "unknown", now
+    if not week or week['used'] is None:
+        if cycle_running(quota, '3p-5h', now, observed_at=observed_at,
+                         previous=previous, previous_observed=previous_observed):
+            return 'wait', quota['3p-5h']['end'] + GRACE
+        return 'unknown', now
     if week["disabled"] or week["used"] >= 100:
         end = week["end"]
         return ("wait", end + GRACE) if end and end + GRACE > now else ("due", now)
     # A weekly boundary also warrants a fresh quota read.
     if week["end"] and week["end"] + GRACE <= now:
         return "due", now
-    if not short or short["disabled"] or short["used"] is None:
-        return "unknown", now
+    if not short or short['disabled']:
+        return 'unknown', now
     if short["end"] and short["end"] + GRACE <= now:
         return "due", now
-    if short["used"] == 0:
+    running = cycle_running(quota, '3p-5h', now, observed_at=observed_at,
+                            previous=previous, previous_observed=previous_observed)
+    if not running and observed_at > 0 and short.get('end') and short['end'] < observed_at + FIVE_HOURS - 15:
+        return 'observe', now + 60
+    if short['used'] is None and not running:
+        return 'unknown', now
+    if short['used'] == 0 and not running:
         # For unused windows the API returns now+5h, not a fixed running clock.
         return "unused", now
     if not short["end"]:

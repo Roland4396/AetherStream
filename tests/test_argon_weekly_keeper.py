@@ -92,6 +92,7 @@ class WeeklyTests(unittest.IsolatedAsyncioTestCase):
         row = {}; api = FakeApi()
         await self.run_account(api, row)
         api.value = reading(0.99999)
+        api.value['observed_at_ms'] = (NOW+61)*1000
         await self.run_account(api, row, NOW + 61)
         self.assertTrue(row['cycle_confirmed'])
         self.assertFalse(row['uncertain_attempt'])
@@ -161,8 +162,10 @@ class WeeklyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(row['cycle_confirmed'])
 
     async def test_current_use_can_confirm_an_uncertain_request(self):
-        row = {'uncertain_attempt': True}; api = FakeApi(reading(.8))
+        row = {'uncertain_attempt': True}; api = FakeApi(reading(.8, NOW + argon.WEEK - 60))
         await self.run_account(api, row)
+        api.value['observed_at_ms'] = (NOW+61)*1000
+        await self.run_account(api, row, NOW+61)
         self.assertTrue(row['cycle_confirmed'])
         self.assertFalse(api.generations)
 

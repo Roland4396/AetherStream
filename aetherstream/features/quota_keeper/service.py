@@ -10,12 +10,12 @@ import httpx
 
 from aetherstream.utils.coerce import coerce_bool
 from .client import GproxyClient, MODEL, ProbeError
-from .policy import FIVE_HOURS, GRACE, RETRY_DELAYS, account_groups, decision, observed, windows
+from .policy import FIVE_HOURS, GRACE, RETRY_DELAYS, account_groups, cycle_running, decision, observed, windows
 from .state import StateError, StateStore
-from . import argon
+from . import argon, claude
 
 
-async def handle_account(api, members, row, persist, emit, *, clock=time.time, may_generate=lambda: True):
+async def handle_account(api, members, row, persist, emit, *, clock=time.time, may_generate=lambda: True, model=MODEL):
     now = clock()
     if row.get("paused") or now < row.get("next_at", 0):
         return
@@ -26,67 +26,94 @@ async def handle_account(api, members, row, persist, emit, *, clock=time.time, m
     cid = c["id"]
     row["credential_id"] = cid
     quota = windows(cached)
-    action, next_at = decision(quota, now)
-    if action == "wait" and not row.get("pending_verify"):
-        row.update(next_at=next_at, status="waiting", windows=quota, failures=0)
+    prior = row.get('windows') or {}
+    prior_observed = row.get('observed_at_ms', 0) / 1000
+    unconfirmed = bool(row.get('pending_verify') or row.get('uncertain_attempt')
+                       or (row.get('last_trigger_at') and not row.get('cycle_confirmed')))
+    action, next_at = decision(quota, now, observed_at=observed(cached) / 1000,
+                               previous=prior, previous_observed=prior_observed)
+    if action == 'wait' and not unconfirmed:
+        row.update(next_at=next_at, status="waiting", windows=quota, failures=0,
+                   observed_at_ms=observed(cached), cycle_confirmed=cycle_running(
+                       quota, '3p-5h', now, observed_at=observed(cached) / 1000,
+                       previous=prior, previous_observed=prior_observed))
         persist()
         return
     snapshot = await api.probe(cid)
     now = clock()
     quota = windows(snapshot)
-    action, next_at = decision(quota, now)
+    action, next_at = decision(quota, now, observed_at=observed(snapshot) / 1000,
+                               previous=prior, previous_observed=prior_observed)
     row.update(windows=quota, last_probe_at=now, observed_at_ms=observed(snapshot))
+    if action == 'observe':
+        row.update(status='awaiting_cycle_clock', next_at=now + 60, failures=0)
+        persist()
+        return
     if action == "wait":
         short = quota.get("3p-5h", {})
-        confirmed = (short.get("used") or 0) > 0 and (short.get("end") or 0) > now
-        if row.get("pending_verify"):
-            row["pending_verify"] = False
-            row["cycle_confirmed"] = confirmed
-            if confirmed:
-                row["guard_until"] = short["end"] + GRACE
-            emit("cycle_checked", credential_id=cid, confirmed=confirmed,
-                 next_at=next_at)
-        row.update(next_at=next_at, status="waiting", failures=0)
+        confirmed = cycle_running(quota, '3p-5h', now,
+                                  observed_at=observed(snapshot) / 1000,
+                                  previous=prior, previous_observed=prior_observed)
+        if unconfirmed:
+            if not confirmed:
+                checks = row.get('clock_checks', 0) + 1
+                row.update(clock_checks=checks, pending_verify=checks < 2,
+                           cycle_confirmed=False, uncertain_attempt=True, failures=0,
+                           status='awaiting_cycle_clock' if checks < 2 else 'paused_unconfirmed_generation',
+                           next_at=now + 60, paused=checks >= 2)
+                persist()
+                emit('cycle_checked', credential_id=cid, confirmed=False, clock_checks=checks)
+                return
+            row.update(pending_verify=False, cycle_confirmed=True,
+                       uncertain_attempt=False, clock_checks=0, guard_until=short['end'] + GRACE)
+            emit('cycle_checked', credential_id=cid, confirmed=True, next_at=next_at)
+        row.update(next_at=next_at if confirmed else min(next_at, now + 60),
+                   status='waiting' if confirmed else 'awaiting_cycle_clock', failures=0,
+                   cycle_confirmed=confirmed)
         persist()
         return
     if action != "unused":
         # Unknown or stale quota must not cause a generation.
         raise ProbeError("Claude window unavailable or reset has not advanced")
-    guard = row.get("guard_until", 0)
-    if now < guard:
-        # A timed-out/crashed request might already have reached the upstream.
-        # Query for evidence, but never blindly submit another completion.
-        unconfirmed = bool(row.get("pending_verify"))
-        row.update(next_at=guard,
-                   status="paused_unconfirmed_generation" if unconfirmed else "request_guard",
-                   pending_verify=False, cycle_confirmed=False, failures=0)
-        if unconfirmed:
-            row["paused"] = True
-            emit("account_paused", credential_id=cid, reason="generation_cycle_not_confirmed")
+    guard = row.get('guard_until', 0)
+    if unconfirmed:
+        # Uncertainty survives guard expiry and explicit resume. Never turn a
+        # clock/metadata failure into a second potentially paid completion.
+        row.update(next_at=max(guard, now + 60), status='paused_unconfirmed_generation',
+                   pending_verify=False, uncertain_attempt=True, cycle_confirmed=False,
+                   paused=True, failures=0)
         persist()
+        emit('account_paused', credential_id=cid, reason='generation_cycle_not_confirmed')
+        return
+    if now < guard:
+        row.update(next_at=guard, status='request_guard', failures=0)
+        persist()
+        return
+    if model not in snapshot.get('available_models', []):
+        row.update(status='paused_model_unavailable', paused=True, failures=0, model=model)
+        persist()
+        emit('account_paused', credential_id=cid, reason='configured_model_not_in_catalogue')
         return
     if not may_generate():
         persist()
         return
     row.update(last_trigger_at=now, guard_until=now + FIVE_HOURS + GRACE,
-               pending_verify=True, cycle_confirmed=False, next_at=now + 60,
+               pending_verify=True, uncertain_attempt=True, cycle_confirmed=False, clock_checks=0, next_at=now + 60,
+               model=model,
                status="submitted", triggers=row.get("triggers", 0) + 1, failures=0)
     persist()  # Durable BEFORE POST: a restart must not duplicate this request.
     try:
-        result = await api.generate(cid)
-    except (httpx.HTTPError, ValueError, KeyError) as e:
+        result = argon.safe_result(await api.generate(cid, provider_id=c['provider_id'], model=model))
+    except (httpx.HTTPError, ProbeError, ValueError, KeyError) as e:
         row.update(status="delivery_uncertain", generation_error=type(e).__name__)
         persist()
         emit("delivery_uncertain", credential_id=cid, error_type=type(e).__name__)
         return
-    row["last_generation"] = result
-    if result["ok"]:
-        row["status"] = "pending_verification"
-        emit("claude_triggered", credential_id=cid, **result)
-    else:
-        # Verification failures/model errors are not retried indefinitely.
-        row.update(status="paused_generation_error", paused=True, pending_verify=False)
-        emit("account_paused", credential_id=cid, http_status=result["http_status"])
+    row['last_generation'] = result
+    row['status'] = 'pending_verification' if result['ok'] else 'response_unverified'
+    # A response is not a verified running cycle. Never log "triggered/success"
+    # solely because HTTP succeeded and an arbitrary text part was nonempty.
+    emit('claude_response_received', credential_id=cid, **result)
     persist()
 
 
@@ -105,7 +132,7 @@ def quota_failure(row, now, error, persist, emit):
         # without logging exception text, tokens, headers, bodies or URLs.
         fields.update(http_status=error.response.status_code, method=error.request.method)
         operation = error.request.url.path.rsplit('/', 1)[-1]
-        if operation in ('quota-probe', 'quota', 'reveal', 'login', 'providers', 'credentials'):
+        if operation in ('quota-probe', 'quota-diagnostics', 'quota', 'reveal', 'login', 'providers', 'credentials', 'test'):
             fields['operation'] = operation.replace('-', '_')
     emit("quota_failed", **fields)
 
@@ -142,6 +169,12 @@ class QuotaKeeper:
             value = 60
         # Configuration cannot turn this feature into a request flood.
         return min(3600, max(60, value))
+
+    def claude_settings(self):
+        try:
+            return claude.settings(self.lookup('quota_keeper', 'claude'))
+        except (ValueError, TypeError):
+            return {'enabled': False, 'model': MODEL, 'configuration_error': 'invalid_settings'}
 
     def argon_settings(self):
         try:
@@ -225,13 +258,16 @@ class QuotaKeeper:
                                 break
                             row = state['accounts'].setdefault(key, {})
                             row.update(credential_ids=sorted(c['id'] for c in members), active=True)
-                            try:
-                                await handle_account(
-                                    api, members, row, persist, self.emit, clock=self.clock,
-                                    may_generate=lambda: self.enabled() and not self._stop.is_set(),
-                                )
-                            except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
-                                quota_failure(row, self.clock(), exc, persist, self.emit)
+                            claude_config = self.claude_settings()
+                            if claude_config['enabled']:
+                                try:
+                                    await handle_account(
+                                        api, members, row, persist, self.emit, clock=self.clock,
+                                        model=claude_config['model'], may_generate=lambda: (
+                                            self.enabled() and not self._stop.is_set()
+                                            and self.claude_settings() == claude_config))
+                                except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
+                                    quota_failure(row, self.clock(), exc, persist, self.emit)
                             argon_config = self.argon_settings()
                             if argon_config['enabled'] and self.enabled() and not self._stop.is_set():
                                 weekly = row.setdefault('argon_weekly', {})
@@ -267,7 +303,7 @@ class QuotaKeeper:
             error = type(exc).__name__
         accounts = []
         for row in state['accounts'].values():
-            generation = row.get('last_generation') or {}
+            generation = argon.safe_result(row.get('last_generation') or {})
             accounts.append({
                 'credential_ids': row.get('credential_ids', []),
                 'credential_id': row.get('credential_id'),
@@ -280,18 +316,21 @@ class QuotaKeeper:
                 'last_probe_at': row.get('last_probe_at'),
                 'cycle_confirmed': bool(row.get('cycle_confirmed')),
                 'pending_verify': bool(row.get('pending_verify')),
+                'uncertain_attempt': bool(row.get('uncertain_attempt')),
+                'model': row.get('model'),
                 'attempts': row.get('triggers', 0),
                 'quota_failures': row.get('failures', 0),
                 'windows': row.get('windows', {}),
                 'argon_weekly': argon.status(row.get('argon_weekly', {})),
                 'last_generation': {key: generation[key] for key in
-                    ('http_status', 'ok', 'usage') if key in generation},
+                    ('http_status', 'ok', 'transport_ok', 'generation_evidence', 'usage') if key in generation},
             })
         return {
             'enabled': enabled,
             'status': 'disabled' if not enabled else ('degraded' if error else
                       'standby' if self._lock_busy else 'running'),
-            'model': MODEL,
+            'model': self.claude_settings()['model'],
+            'claude': self.claude_settings(),
             'argon_weekly': self.argon_settings(),
             'check_interval_sec': self.interval(),
             'worker_running': self._task is not None and not self._task.done(),

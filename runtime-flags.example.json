@@ -1,6 +1,10 @@
 {
   "quota_keeper": {
     "enabled": false,
+    "claude": {
+      "enabled": true,
+      "model": "claude-opus-5-5-low"
+    },
     "argon_weekly": {
       "enabled": false,
       "model": "gemini-4-argon-low"

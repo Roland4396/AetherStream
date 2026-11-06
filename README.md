@@ -280,24 +280,33 @@ Enable it through the existing hot-reloaded runtime flags (disabled by default):
 ```json
 "quota_keeper": {
   "enabled": true,
-  "check_interval_sec": 60
+  "check_interval_sec": 60,
+  "claude": {"enabled": true, "model": "claude-opus-5-5-low"}
 }
 ```
 
 The interval is a schedule check, **not a generation frequency** (minimum 60s).
 Only enabled Antigravity credentials are considered; duplicate email imports
-share one schedule. Only Claude `3p-5h` and `3p-weekly` windows control decisions.
+share one schedule. Only Claude `3p-5h` and `3p-weekly` windows control its decisions.
 An already-running cycle is left alone regardless of remaining quota; an
 exhausted weekly quota waits for its reset. An unused quota response's sliding
 `now + 5h` deadline is not treated as an active clock. Before a wakeup, a fresh
 successful quota probe must still show an unused available Claude window.
 
-A wakeup uses the exact selected credential and fixed
-`claude-opus-4-6-thinking` model, asks only for `OK`, and caps output at 64 tokens
-with thinking disabled. There are no generation retries, model/account fallback,
-or Gemini generations. HTTP generation errors pause that account; quota lookup
-errors have bounded backoff. Viewing status or checking health never probes or
-generates upstream.
+A wakeup uses the exact selected provider and credential through GProxy's native
+management generation path: `ping`, maximum 16 output tokens, one attempt, no
+account/model fallback, no direct Google request and no credential reveal.
+The model is configured under `quota_keeper.claude.model` and must be present and
+enabled in that account's fresh native catalogue; a retired name pauses without
+spending. Claude can be disabled independently of Argon.
+
+HTTP success and nonempty text are not generation proof. Only sanitized native
+usage can establish generation evidence, and only a reset time remaining fixed
+across distinct quota observations confirms a running cycle. Zero reported usage
+is supported; sliding unused deadlines and stale cached snapshots are not
+running-cycle evidence. An uncertain paid attempt never becomes eligible for
+resubmission merely because its guard elapsed or an operator requested resume.
+See [Claude cycle verification and recovery](docs/claude-quota-keeper.md).
 
 Deployment settings:
 
