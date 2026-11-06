@@ -177,6 +177,12 @@ class QuotaKeeper:
         except (ValueError, TypeError):
             return {'enabled': False, 'model': MODEL, 'configuration_error': 'invalid_settings'}
 
+    def configured_claude_model(self, ids):
+        try:
+            return claude.select_model(self.claude_settings(), [{'id': cid} for cid in ids])
+        except (ValueError, TypeError, KeyError):
+            return None
+
     def argon_settings(self):
         try:
             return argon.settings(self.lookup('quota_keeper', 'argon_weekly'))
@@ -264,7 +270,7 @@ class QuotaKeeper:
                                 try:
                                     await handle_account(
                                         api, members, row, persist, self.emit, clock=self.clock,
-                                        model=claude_config['model'], may_generate=lambda: (
+                                        model=claude.select_model(claude_config, members), may_generate=lambda: (
                                             self.enabled() and not self._stop.is_set()
                                             and self.claude_settings() == claude_config))
                                 except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
@@ -319,6 +325,7 @@ class QuotaKeeper:
                 'pending_verify': bool(row.get('pending_verify')),
                 'uncertain_attempt': bool(row.get('uncertain_attempt')),
                 'model': row.get('model'),
+                'configured_model': self.configured_claude_model(row.get('credential_ids', [])),
                 'attempts': row.get('triggers', 0),
                 'quota_failures': row.get('failures', 0),
                 'windows': row.get('windows', {}),

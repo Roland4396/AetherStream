@@ -9,7 +9,7 @@ import time
 
 import httpx
 
-MODEL = 'claude-opus-5-5-low'
+MODEL = 'claude-opus-4-6-thinking'
 
 
 class ProbeError(Exception):

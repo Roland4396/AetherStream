@@ -2,7 +2,7 @@
 
 ## Fix scope
 
-The retired implementation directly requested the fixed `claude-opus-4-6-thinking` name and marked any HTTP-successful response with nonempty candidate text as successful, even without a response model or token usage. It could not prove that the requested model actually generated. Those legacy results remain historical records, not verified model identity. The private status API now projects empty-usage results as unverified.
+The previous implementation directly requested the fixed `claude-opus-4-6-thinking` name and marked any HTTP-successful response with nonempty candidate text as successful, even without a response model or token usage. It could not prove that the requested model actually generated. Those legacy results remain historical records, not verified model identity. The model itself is not globally retired: fresh catalogues still advertise 4.6 on older accounts, while accounts 12 and 31 advertise 5.5. A new account must not dictate the model for the whole pool. The private status API now projects empty-usage results as unverified.
 
 Claude keepalive now uses GProxy's existing native exact-provider/exact-credential management generation, preserving its client/session identity and native model translation. It never reveals an account secret, calls Google directly, passes through Stream's story transforms, or silently falls back to another model/account. GProxy currently sends `ping` with a native output cap of 16 tokens and one core attempt.
 
@@ -15,13 +15,17 @@ Claude keepalive now uses GProxy's existing native exact-provider/exact-credenti
     "check_interval_sec": 60,
     "claude": {
       "enabled": true,
-      "model": "claude-opus-5-5-low"
+      "model": "claude-opus-4-6-thinking",
+      "account_models": {
+        "12": "claude-opus-5-5-low",
+        "31": "claude-opus-5-5-low"
+      }
     }
   }
 }
 ```
 
-The selected model is read from configuration, with no hardcoded per-request model override. The default is the current Opus 5.5 low alias. A fresh native catalogue must explicitly offer the exact configured model before a completion may be submitted. Missing, disabled, malformed or stale model/quota evidence cannot authorize spending. Model withdrawal pauses that account without generating. Updating the configured model never authorizes account/model fallback or clears an existing paid guard.
+The selected model is read from configuration, with no hardcoded per-request model override. The default preserves Opus 4.6 for older accounts. The explicit `account_models` map assigns Opus 5.5 low to accounts 12 and 31. Numeric legacy IDs and native credential IDs normalize to one identity. Duplicate imports of one email share an override; conflicting overrides fail closed. This is selection before a request, never fallback after a failed request. A fresh native catalogue must explicitly offer the exact configured model before a completion may be submitted. Missing, disabled, malformed or stale model/quota evidence cannot authorize spending. Model withdrawal pauses that account without generating. Updating the configured model never authorizes account/model fallback or clears an existing paid guard.
 
 `claude.enabled=false` independently disables Claude work; Argon retains its own setting. The global keeper switch disables both. Invalid Claude settings fail closed only for Claude. Existing public chat routing and prompts are unaffected.
 

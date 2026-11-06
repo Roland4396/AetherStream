@@ -3,7 +3,11 @@
     "enabled": false,
     "claude": {
       "enabled": true,
-      "model": "claude-opus-5-5-low"
+      "model": "claude-opus-4-6-thinking",
+      "account_models": {
+        "12": "claude-opus-5-5-low",
+        "31": "claude-opus-5-5-low"
+      }
     },
     "argon_weekly": {
       "enabled": false,

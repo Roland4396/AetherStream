@@ -281,7 +281,11 @@ Enable it through the existing hot-reloaded runtime flags (disabled by default):
 "quota_keeper": {
   "enabled": true,
   "check_interval_sec": 60,
-  "claude": {"enabled": true, "model": "claude-opus-5-5-low"}
+  "claude": {
+    "enabled": true,
+    "model": "claude-opus-4-6-thinking",
+    "account_models": {"12": "claude-opus-5-5-low", "31": "claude-opus-5-5-low"}
+  }
 }
 ```
 
@@ -296,8 +300,10 @@ successful quota probe must still show an unused available Claude window.
 A wakeup uses the exact selected provider and credential through GProxy's native
 management generation path: `ping`, maximum 16 output tokens, one attempt, no
 account/model fallback, no direct Google request and no credential reveal.
-The model is configured under `quota_keeper.claude.model` and must be present and
-enabled in that account's fresh native catalogue; a retired name pauses without
+The default model is configured under `quota_keeper.claude.model`; explicit
+`account_models` overrides select a different alias only for those accounts.
+Never extrapolate one account's catalogue to the whole pool. Each selected model must be present and
+enabled in that account's fresh native catalogue; an unavailable name pauses without
 spending. Claude can be disabled independently of Argon.
 
 HTTP success and nonempty text are not generation proof. Only sanitized native

@@ -61,8 +61,9 @@ class ClaudeRegressionTests(unittest.IsolatedAsyncioTestCase):
         await handle_account(api,MEMBERS,row,lambda:None,lambda *a,**k:None,
                              clock=lambda:now,**kwargs)
 
-    async def test_retired_model_not_in_fresh_catalogue_never_posts(self):
+    async def test_unavailable_model_not_in_fresh_catalogue_never_posts(self):
         api=FakeApi();row={}
+        api.fresh['available_models']=['claude-opus-5-5-low']
         await self.run_account(api,row,model='claude-opus-4-6-thinking')
         self.assertEqual(row['status'],'paused_model_unavailable')
         self.assertTrue(row['paused']);self.assertFalse(api.generations)
