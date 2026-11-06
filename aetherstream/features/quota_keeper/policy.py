@@ -34,7 +34,7 @@ def windows(snapshot):
 
 
 def reset_clock_running(end, observed_at, duration, now, *, previous_end=None,
-                        previous_observed=None):
+                        previous_observed=None, previous_confirmed=False):
     """A fixed countdown, not the sliding unused now+duration placeholder.
 
     Compare against the snapshot's observation time, never current time alone:
@@ -46,6 +46,10 @@ def reset_clock_running(end, observed_at, duration, now, *, previous_end=None,
         return False
     if observed_at <= 0 or observed_at > now + 2 or end <= now:
         return False
+    matching = (isinstance(previous_end, (int, float)) and not isinstance(previous_end, bool)
+                and math.isfinite(previous_end) and abs(end - previous_end) <= 2)
+    if previous_confirmed is True and matching:
+        return True  # Retain durable proof for the same still-live cycle.
     return (isinstance(previous_end, (int, float)) and not isinstance(previous_end, bool)
             and isinstance(previous_observed, (int, float)) and not isinstance(previous_observed, bool)
             and math.isfinite(previous_end) and math.isfinite(previous_observed)
@@ -54,7 +58,7 @@ def reset_clock_running(end, observed_at, duration, now, *, previous_end=None,
 
 
 def cycle_running(quota, kind, now, *, observed_at=0, previous=None,
-                  previous_observed=0):
+                  previous_observed=0, previous_confirmed=False):
     window = quota.get(kind, {})
     end = window.get('end')
     if not isinstance(end, (int, float)) or end <= now or window.get('disabled'):
@@ -63,15 +67,15 @@ def cycle_running(quota, kind, now, *, observed_at=0, previous=None,
     return reset_clock_running(end, observed_at,
         FIVE_HOURS if kind == '3p-5h' else 7 * 24 * 3600, now,
         previous_end=(previous or {}).get(kind, {}).get('end'),
-        previous_observed=previous_observed)
+        previous_observed=previous_observed, previous_confirmed=previous_confirmed)
 
 
-def decision(quota, now, *, observed_at=0, previous=None, previous_observed=0):
+def decision(quota, now, *, observed_at=0, previous=None, previous_observed=0, previous_confirmed=False):
     """Return wait(deadline), due, unused, or unknown; never invent a reset."""
     week, short = quota.get("3p-weekly"), quota.get("3p-5h")
     if not week or week['used'] is None:
         if cycle_running(quota, '3p-5h', now, observed_at=observed_at,
-                         previous=previous, previous_observed=previous_observed):
+                         previous=previous, previous_observed=previous_observed, previous_confirmed=previous_confirmed):
             return 'wait', quota['3p-5h']['end'] + GRACE
         return 'unknown', now
     if week["disabled"] or week["used"] >= 100:
@@ -85,7 +89,7 @@ def decision(quota, now, *, observed_at=0, previous=None, previous_observed=0):
     if short["end"] and short["end"] + GRACE <= now:
         return "due", now
     running = cycle_running(quota, '3p-5h', now, observed_at=observed_at,
-                            previous=previous, previous_observed=previous_observed)
+                            previous=previous, previous_observed=previous_observed, previous_confirmed=previous_confirmed)
     if not running and observed_at > 0 and short.get('end') and short['end'] < observed_at + FIVE_HOURS - 15:
         return 'observe', now + 60
     if short['used'] is None and not running:

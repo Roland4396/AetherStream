@@ -27,23 +27,24 @@ async def handle_account(api, members, row, persist, emit, *, clock=time.time, m
     row["credential_id"] = cid
     quota = windows(cached)
     prior = row.get('windows') or {}
+    prior_confirmed = row.get('cycle_confirmed') is True
     prior_observed = row.get('observed_at_ms', 0) / 1000
     unconfirmed = bool(row.get('pending_verify') or row.get('uncertain_attempt')
                        or (row.get('last_trigger_at') and not row.get('cycle_confirmed')))
     action, next_at = decision(quota, now, observed_at=observed(cached) / 1000,
-                               previous=prior, previous_observed=prior_observed)
+                               previous=prior, previous_observed=prior_observed, previous_confirmed=prior_confirmed)
     if action == 'wait' and not unconfirmed:
         row.update(next_at=next_at, status="waiting", windows=quota, failures=0,
                    observed_at_ms=observed(cached), cycle_confirmed=cycle_running(
                        quota, '3p-5h', now, observed_at=observed(cached) / 1000,
-                       previous=prior, previous_observed=prior_observed))
+                       previous=prior, previous_observed=prior_observed, previous_confirmed=prior_confirmed))
         persist()
         return
     snapshot = await api.probe(cid)
     now = clock()
     quota = windows(snapshot)
     action, next_at = decision(quota, now, observed_at=observed(snapshot) / 1000,
-                               previous=prior, previous_observed=prior_observed)
+                               previous=prior, previous_observed=prior_observed, previous_confirmed=prior_confirmed)
     row.update(windows=quota, last_probe_at=now, observed_at_ms=observed(snapshot))
     if action == 'observe':
         row.update(status='awaiting_cycle_clock', next_at=now + 60, failures=0)
@@ -53,7 +54,7 @@ async def handle_account(api, members, row, persist, emit, *, clock=time.time, m
         short = quota.get("3p-5h", {})
         confirmed = cycle_running(quota, '3p-5h', now,
                                   observed_at=observed(snapshot) / 1000,
-                                  previous=prior, previous_observed=prior_observed)
+                                  previous=prior, previous_observed=prior_observed, previous_confirmed=prior_confirmed)
         if unconfirmed:
             if not confirmed:
                 checks = row.get('clock_checks', 0) + 1

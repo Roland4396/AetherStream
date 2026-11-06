@@ -59,6 +59,7 @@ async def handle_argon_account(api, members, row, persist, emit, *, model,
     reading = await api.argon_probe(cid)
     now = clock()
     previous_window = row.get('window') or {}
+    previous_confirmed = row.get('cycle_confirmed') is True
     previous_observed = row.get('observed_at_ms', 0) / 1000
     row.update(last_probe_at=now, observed_at_ms=reading['observed_at_ms'],
                available=reading['available'], window={k: reading[k] for k in
@@ -81,7 +82,7 @@ async def handle_argon_account(api, members, row, persist, emit, *, model,
         raise ProbeError('Invalid or stale Argon weekly window')
     running = reset_clock_running(end, reading['observed_at_ms'] / 1000, WEEK, now,
                                   previous_end=previous_window.get('end'),
-                                  previous_observed=previous_observed)
+                                  previous_observed=previous_observed, previous_confirmed=previous_confirmed)
     possible_clock = end < reading['observed_at_ms'] / 1000 + WEEK - 15
     if remaining < 1 or running or possible_clock:
         # A depleted/full balance cannot override a genuine fixed reset clock.

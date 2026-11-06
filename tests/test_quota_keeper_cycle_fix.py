@@ -274,3 +274,19 @@ class ConfigIsolationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(row['cycle_confirmed']);self.assertFalse(row['uncertain_attempt'])
             self.assertEqual(row['triggers'],9);self.assertEqual(row['unrelated_legacy'],77)
             self.assertEqual(row['argon_weekly'],old['argon_weekly']);self.assertFalse(api.generations)
+
+
+class ConfirmedCycleRetentionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_same_cached_snapshot_cannot_erase_a_previously_confirmed_claude_cycle(self):
+        api=FakeApi(snapshot(short_used=.01));q=windows(api.cached_value)
+        row={'cycle_confirmed':True,'windows':q,'observed_at_ms':NOW*1000,
+             'last_trigger_at':NOW-30,'guard_until':NOW+18030,'next_at':0}
+        await handle_account(api,MEMBERS,row,lambda:None,lambda *a,**k:None,clock=lambda:NOW+1)
+        self.assertTrue(row['cycle_confirmed']);self.assertFalse(api.generations)
+
+    async def test_immediate_argon_recheck_preserves_confirmed_weekly_clock(self):
+        api=ArgonApi(reading(.9));row={'cycle_confirmed':True,'window':{'remaining':.9,'end':NOW+argon.WEEK},
+            'observed_at_ms':NOW*1000,'last_trigger_at':NOW-30,'guard_until':NOW+argon.WEEK+30}
+        await argon.handle_argon_account(api,ARGON_MEMBERS,row,lambda:None,lambda *a,**k:None,
+            model='gemini-4-argon-low',clock=lambda:NOW+1)
+        self.assertTrue(row['cycle_confirmed']);self.assertFalse(api.generations)
