@@ -197,6 +197,13 @@ def global_policy(lookup):
             validate_settings(kunlun_linux)
         except (ValueError, TypeError, AttributeError) as exc:
             raise RegistryError('invalid kunlun_linux configuration: ' + str(exc)) from exc
+    kunlun_rules = lookup('kunlun_linux_model_rules')
+    if kunlun_rules is not None:
+        from aetherstream.features.kunlun_selection import validate_model_rules
+        try:
+            validate_model_rules(kunlun_rules)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RegistryError('invalid kunlun_linux_model_rules configuration: ' + str(exc)) from exc
     value = {k: copy.deepcopy(lookup(k)) for k in ('early_stop','streaming','filters')
              if lookup(k) is not None}
     value['runtime'] = {k: copy.deepcopy(lookup(k)) for k in ('claude','injections')
@@ -230,8 +237,9 @@ def enrich_selection(lookup, selection):
     mode = request_mode.resolve(cfg, cid, upstream)
     policy.setdefault('streaming', {})['force_upstream'] = mode['mode']
     policy['streaming'].pop('nonstream_to_stream', None)
-    from aetherstream.features.kunlun_linux import selected_settings as selected_kunlun_linux
-    kunlun_linux = selected_kunlun_linux(lookup('kunlun_linux'), selection)
+    from aetherstream.features.kunlun_selection import selected_settings as selected_kunlun_linux
+    kunlun_linux = selected_kunlun_linux(
+        lookup('kunlun_linux'), selection, model_rules=lookup('kunlun_linux_model_rules'))
     output_tool = None
     if kunlun_linux is not None:
         # Kunlun owns the delivery envelope for its exact target.  Do not stack

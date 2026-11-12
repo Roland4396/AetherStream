@@ -25,6 +25,7 @@ FEATURE_CONTRACTS = {
     'input_transforms': 'request',
     'output_tool': 'request',
     'kunlun_linux': 'request',
+    'kunlun_selection': 'request',
 }
 CONTRACT = {'lifecycle': 1, 'api': 1, 'state_read_min': 1, 'state_read_max': 1, 'state_write': 1}
 
