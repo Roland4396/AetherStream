@@ -12,7 +12,7 @@ from aetherstream.utils.coerce import coerce_bool
 from .client import GproxyClient, MODEL, ProbeError
 from .policy import FIVE_HOURS, GRACE, RETRY_DELAYS, account_groups, cycle_running, decision, observed, windows
 from .state import StateError, StateStore
-from . import argon, claude
+from . import argon, claude, hydrogen
 
 
 async def handle_account(api, members, row, persist, emit, *, clock=time.time, may_generate=lambda: True, model=MODEL):
@@ -190,6 +190,13 @@ class QuotaKeeper:
             return {'enabled': False, 'model': 'gemini-4-argon-low',
                     'configuration_error': 'invalid_settings'}
 
+    def hydrogen_settings(self):
+        try:
+            return hydrogen.settings(self.lookup('quota_keeper', 'hydrogen'))
+        except (ValueError, TypeError):
+            return {'enabled': False, 'model': hydrogen.DEFAULT_MODEL,
+                    'configuration_error': 'invalid_settings'}
+
     def emit(self, event: str, **fields):
         # Do not pass exception messages, credentials, arbitrary reply text or URLs.
         fields.pop('reply', None)
@@ -286,6 +293,22 @@ class QuotaKeeper:
                                                               and self.argon_settings() == argon_config))
                                 except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
                                     argon.quota_failure(weekly, self.clock(), exc, persist, self.emit)
+                            hydrogen_config = self.hydrogen_settings()
+                            if hydrogen_config['enabled'] and self.enabled() and not self._stop.is_set():
+                                shared = row.setdefault('hydrogen', {})
+                                if hydrogen.permission_refusal(row):
+                                    shared.update(paused=True, status='paused_account_permission')
+                                    persist()
+                                else:
+                                    try:
+                                        await hydrogen.handle_account(
+                                            api, members, shared, persist, self.emit,
+                                            model=hydrogen_config['model'], clock=self.clock,
+                                            may_generate=lambda: (self.enabled() and not self._stop.is_set()
+                                                and self.hydrogen_settings() == hydrogen_config
+                                                and not hydrogen.permission_refusal(row)))
+                                    except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
+                                        hydrogen.quota_failure(shared, self.clock(), exc, persist, self.emit)
                     state['last_run_at'] = self.clock()
                     state['schema_version'] = 1
                     persist()
@@ -330,6 +353,7 @@ class QuotaKeeper:
                 'quota_failures': row.get('failures', 0),
                 'windows': row.get('windows', {}),
                 'argon_weekly': argon.status(row.get('argon_weekly', {})),
+                'hydrogen': hydrogen.status(row.get('hydrogen', {})),
                 'last_generation': {key: generation[key] for key in
                     ('http_status', 'ok', 'transport_ok', 'generation_evidence', 'usage') if key in generation},
             })
@@ -340,6 +364,7 @@ class QuotaKeeper:
             'model': self.claude_settings()['model'],
             'claude': self.claude_settings(),
             'argon_weekly': self.argon_settings(),
+            'hydrogen': self.hydrogen_settings(),
             'check_interval_sec': self.interval(),
             'worker_running': self._task is not None and not self._task.done(),
             'in_sweep': self._in_sweep,
@@ -385,5 +410,24 @@ class QuotaKeeper:
                                       status='resume_scheduled')
                         self.store.save(state)
                         self.emit('argon_resume_scheduled', credential_id=credential_id)
+                        return 'scheduled'
+                return 'not_found'
+
+    async def resume_hydrogen(self, credential_id):
+        """Recheck only: an uncertain paid attempt is never erased by resume."""
+        if self._mutation_lock.locked():
+            return 'busy'
+        async with self._mutation_lock:
+            with self.store.locked() as acquired:
+                if not acquired:
+                    return 'busy'
+                state = self.store.load()
+                for row in state['accounts'].values():
+                    if credential_id in row.get('credential_ids', []):
+                        weekly = row.setdefault('hydrogen', {})
+                        weekly.update(paused=False, failures=0, next_at=0,
+                                      status='resume_scheduled')
+                        self.store.save(state)
+                        self.emit('hydrogen_resume_scheduled', credential_id=credential_id)
                         return 'scheduled'
                 return 'not_found'

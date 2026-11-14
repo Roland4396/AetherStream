@@ -155,6 +155,29 @@ class GproxyClient:
         return {'available': True, 'models': models, 'observed_at_ms': observed,
                 **bucket_reading(found[0])}
 
+    async def hydrogen_probe(self, credential_id):
+        from .hydrogen import MODELS, DURATIONS
+        observed, models, buckets = await self.diagnostic(credential_id)
+        models = sorted(models & MODELS)
+        if not models:
+            return {'available': False, 'models': [], 'observed_at_ms': observed}
+        windows = {}
+        for name, duration in DURATIONS.items():
+            found = [b for b in buckets if b.get('bucketId') == name]
+            if len(found) != 1:
+                raise ProbeError('Missing or ambiguous shared Gemini quota')
+            value = bucket_reading(found[0])
+            if value['end'] > observed / 1000 + duration + 300:
+                raise ProbeError('Invalid Hydrogen quota duration')
+            windows[name] = {**value, 'disabled': found[0].get('disabled') is True}
+        return {'available': True, 'models': models, 'observed_at_ms': observed, 'windows': windows}
+
+    async def generate_hydrogen(self, member, model):
+        from .hydrogen import MODELS
+        if model not in MODELS:
+            raise ValueError('Unsupported Hydrogen keepalive model')
+        return await self.model_test(member['provider_id'], member['id'], model)
+
     async def generate_argon(self, member, model):
         if model not in ARGON_MODELS:
             raise ValueError('Unsupported Argon keepalive model')

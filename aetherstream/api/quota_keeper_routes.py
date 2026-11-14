@@ -52,6 +52,19 @@ def register_routes(app, *, keeper, admin_token_file: str):
         code = 409 if result == 'busy' else 404 if result == 'not_found' else 200
         return JSONResponse({'ok': code == 200, 'result': result, 'credential_id': credential_id}, status_code=code)
 
+    async def resume_hydrogen(credential_id: int, request: Request):
+        if not authorized(request, admin_token_file):
+            return JSONResponse({'ok': False, 'error': 'Unauthorized'}, status_code=401)
+        if credential_id <= 0:
+            return JSONResponse({'ok': False, 'error': 'Invalid credential id'}, status_code=400)
+        try:
+            result = await keeper.resume_hydrogen(credential_id)
+        except (StateError, OSError):
+            return JSONResponse({'ok': False, 'error': 'Keeper state unavailable'}, status_code=503)
+        code = 409 if result == 'busy' else 404 if result == 'not_found' else 200
+        return JSONResponse({'ok': code == 200, 'result': result, 'credential_id': credential_id}, status_code=code)
+
     app.get('/admin/quota-keeper')(status)
     app.post('/admin/quota-keeper/credentials/{credential_id}/resume')(resume)
     app.post('/admin/quota-keeper/credentials/{credential_id}/argon/resume')(resume_argon)
+    app.post('/admin/quota-keeper/credentials/{credential_id}/hydrogen/resume')(resume_hydrogen)

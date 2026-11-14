@@ -420,3 +420,7 @@ Argon has a separately opt-in weekly schedule under `quota_keeper.argon_weekly`.
 It reads only the independent Argon bucket, preserves the Claude policy above,
 and uses one tiny exact-account GProxy request only for an unused cycle.
 See [configuration, durable guards and recovery](docs/argon-weekly-keeper.md).
+
+Hydrogen (4h) uses the shared Gemini five-hour and weekly quota; see
+[Hydrogen quota keeper](docs/hydrogen-quota-keeper.md). Argon (4a) retains
+its independent [weekly keeper](docs/argon-weekly-keeper.md).
