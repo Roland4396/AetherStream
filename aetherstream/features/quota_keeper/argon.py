@@ -11,6 +11,7 @@ from .policy import GRACE, RETRY_DELAYS, reset_clock_running
 WEEK = 7 * 24 * 3600
 UNAVAILABLE_RECHECK = 24 * 3600
 VERIFY_DELAY = 60
+QUOTA_RECHECK = 3600
 BUCKET = 'gemini-argon-wtu-weekly'
 MODELS = frozenset('gemini-4-argon-' + level for level in ('low', 'medium', 'high'))
 
@@ -49,7 +50,14 @@ def safe_result(value):
 async def handle_argon_account(api, members, row, persist, emit, *, model,
                                clock, may_generate=lambda: True):
     now = clock()
-    if row.get('paused') or now < row.get('next_at', 0):
+    if row.get('paused'):
+        return
+    # A provider can replenish/change the bucket before our saved reset time.
+    # Revalidate only long-lived waits, at most hourly. This never overrides
+    # probe backoff, daily unavailable rechecks, request guards or ambiguity.
+    stale_wait = (row.get('status') in ('waiting', 'request_guard')
+                  and now - row.get('last_probe_at', 0) >= QUOTA_RECHECK)
+    if now < row.get('next_at', 0) and not stale_wait:
         return
     member = next((c for c in members if c['id'] == row.get('credential_id')), None)
     if member is None:

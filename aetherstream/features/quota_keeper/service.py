@@ -285,14 +285,19 @@ class QuotaKeeper:
                             argon_config = self.argon_settings()
                             if argon_config['enabled'] and self.enabled() and not self._stop.is_set():
                                 weekly = row.setdefault('argon_weekly', {})
-                                try:
-                                    await argon.handle_argon_account(
-                                        api, members, weekly, persist, self.emit,
-                                        model=argon_config['model'], clock=self.clock,
-                                        may_generate=lambda: (self.enabled() and not self._stop.is_set()
-                                                              and self.argon_settings() == argon_config))
-                                except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
-                                    argon.quota_failure(weekly, self.clock(), exc, persist, self.emit)
+                                if hydrogen.permission_refusal(row):
+                                    weekly.update(paused=True, status='paused_account_permission')
+                                    persist()
+                                else:
+                                    try:
+                                        await argon.handle_argon_account(
+                                            api, members, weekly, persist, self.emit,
+                                            model=argon_config['model'], clock=self.clock,
+                                            may_generate=lambda: (self.enabled() and not self._stop.is_set()
+                                                                  and self.argon_settings() == argon_config
+                                                                  and not hydrogen.permission_refusal(row)))
+                                    except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
+                                        argon.quota_failure(weekly, self.clock(), exc, persist, self.emit)
                             hydrogen_config = self.hydrogen_settings()
                             if hydrogen_config['enabled'] and self.enabled() and not self._stop.is_set():
                                 shared = row.setdefault('hydrogen', {})
