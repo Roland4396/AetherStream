@@ -454,6 +454,20 @@ def _parse_gemini(objects: list[dict[str, Any]], *, fallback_model: str) -> Repl
     )
 
 
+def _has_chat_tool_calls(objects: list[dict[str, Any]]) -> bool:
+    """Inspect protocol fields, never tool-like strings inside a reply."""
+    for data in objects:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            continue
+        choice = choices[0]
+        for field in ("delta", "message"):
+            value = choice.get(field)
+            if isinstance(value, dict) and (value.get("tool_calls") or value.get("function_call")):
+                return True
+    return False
+
+
 def parse_replay_record(
     raw_sse_text: str,
     *,
@@ -462,13 +476,32 @@ def parse_replay_record(
 ) -> ReplayRecord:
     events, plain_payload, saw_done, markers = _parse_wire_objects(raw_sse_text)
     output_tool = record_settings(markers)
+    recorded_output_tool = output_tool is not None
+    objects = events if events else ([plain_payload] if plain_payload is not None else [])
+    caller_output_tool = output_tool is None and _has_chat_tool_calls(objects)
+    if caller_output_tool:
+        # Tavern's final-reply envelope has the same wire contract, but no
+        # server-injection marker. Decode ONLY this explicit name/field pair;
+        # never treat arbitrary function arguments as assistant prose.
+        output_tool = {"tool": {"function": {"name": "actual_content"}}, "field": "content"}
     if output_tool is not None:
-        if plain_payload is not None:
-            plain_payload = unwrap_completion(plain_payload, output_tool)
-        decoder = OutputToolStreamDecoder(output_tool)
-        events = [decoder.feed(event) for event in events]
+        try:
+            if plain_payload is not None:
+                plain_payload = unwrap_completion(plain_payload, output_tool)
+            decoder = OutputToolStreamDecoder(output_tool)
+            events = [decoded for event in events if (decoded := decoder.feed(event)) is not None]
+        except (ValueError, TypeError, AttributeError) as exc:
+            # Do not leak argument text, consume an invalid once selection, or
+            # fall through to a paid provider request after a parse failure.
+            raise ReplayPreparationError("selected replay has invalid output-tool arguments") from exc
     source_format = _detect_format(events, plain_payload)
     objects = events if events else ([plain_payload] if plain_payload is not None else [])
+    if caller_output_tool and _has_chat_tool_calls(objects):
+        raise ReplayPreparationError(
+            "selected replay contains an unsupported tool call; only actual_content.content is a final-reply envelope"
+        )
+    if fallback_output_text.strip() in {"[empty response]", "[empty replay response]"}:
+        fallback_output_text = ""
 
     if source_format in {"openai_sse", "openai_json"}:
         record = _parse_openai(
@@ -506,7 +539,7 @@ def parse_replay_record(
 
     if fallback_output_text and (
         (not record.text and not record.reasoning_content)
-        or (output_tool is not None and record.text != fallback_output_text)
+        or (recorded_output_tool and record.text != fallback_output_text)
     ):
         record = ReplayRecord(
             source_format=record.source_format,

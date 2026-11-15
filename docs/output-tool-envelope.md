@@ -24,10 +24,21 @@ existing in-flight locks or cached visible replies.
 
 Raw upstream logs retain their actual tool packets, prefixed with a private
 `OUTPUT_TOOL_ENVELOPE` marker. Saved-response replay uses that marker to decode
-only this proxy-owned envelope; an early-stopped output snapshot remains the
-authority for what was delivered. Old unmarked logs keep their previous parser.
+this proxy-owned envelope; an early-stopped output snapshot remains the authority
+for what was delivered. Unmarked OpenAI chat logs also recognize Tavern's exact
+`actual_content` / `content` final-reply contract, including split function names,
+split arguments and non-streaming completions. This replay-only compatibility
+does not take ownership of caller tools on live inference requests.
 
-Acceptance uses `tests/test_output_tool.py`, the full offline suite, and isolated
+Unmarked arbitrary or mixed ordinary tool calls fail replay preparation instead
+of being silently dropped or executed. Invalid envelope arguments likewise fail
+before consuming a once selection, with no fallback inference. Diagnostic
+`[empty response]` snapshots are not reply text, and an unmarked envelope's
+successfully decoded raw content cannot be overwritten by a stale output file.
+Streaming and JSON replay, as well as the replay list preview, use the same parser.
+
+Acceptance uses `tests/test_output_tool.py`, `tests/test_replay_client_tools.py`,
+the full offline suite, and isolated
 real Nginx SSE/WebSocket promotion/rollback. Never send inference to test this
 feature. Deploy an immutable image via the release controller; do not restart an
 active service or edit Tavern settings/plugins to activate it.
